@@ -1,0 +1,19 @@
+"""Run Stage 3: Assemble matrix from existing classifications."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from screener.assemble import assemble_matrix, print_summary, save_matrix
+
+
+def main():
+    df = assemble_matrix()
+    output = save_matrix(df)
+    print_summary(df)
+    print(f"\nMatrix saved to: {output}")
+
+
+if __name__ == "__main__":
+    main()
