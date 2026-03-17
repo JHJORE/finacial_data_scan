@@ -1,11 +1,9 @@
 """Stage 2: Classify - Determine if company is a programmatic acquirer."""
 
 import asyncio
-import json
 from pathlib import Path
 
 from google import genai
-from google.genai import types
 
 from .config import (
     CLASSIFICATIONS_DIR,
@@ -15,8 +13,13 @@ from .config import (
     REQUESTS_PER_MINUTE,
     RESEARCH_DIR,
 )
-from .models import Classification, ResearchResult
+from .models import Classification, ClassificationResponse, ResearchResult
 from .prompts import CLASSIFICATION_PROMPT
+
+_CLASSIFICATION_CONFIG = {
+    "response_mime_type": "application/json",
+    "response_json_schema": ClassificationResponse.model_json_schema(),
+}
 
 
 def _build_prompt(research: ResearchResult) -> str:
@@ -30,36 +33,29 @@ def _build_prompt(research: ResearchResult) -> str:
 def _parse_classification_response(
     response, research: ResearchResult
 ) -> Classification:
-    """Parse Gemini response into a Classification."""
+    """Parse structured Gemini response into a Classification."""
     text = response.text or ""
 
     try:
-        clean = text.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-            if clean.endswith("```"):
-                clean = clean[:-3]
-            clean = clean.strip()
-
-        data = json.loads(clean)
+        data = ClassificationResponse.model_validate_json(text)
 
         return Classification(
             company_name=research.company_name,
             ticker=research.ticker,
             slug=research.slug,
             year=research.report_year,
-            is_programmatic=data.get("is_programmatic", False),
-            confidence=data.get("confidence", "low"),
-            evidence=data.get("evidence", []),
-            reasoning=data.get("reasoning", ""),
+            is_programmatic=data.is_programmatic,
+            confidence=data.confidence,
+            evidence=data.evidence,
+            reasoning=data.reasoning,
         )
-    except (json.JSONDecodeError, AttributeError):
+    except Exception:
         return Classification(
             company_name=research.company_name,
             ticker=research.ticker,
             slug=research.slug,
             year=research.report_year,
-            error=f"Failed to parse JSON: {text[:200]}",
+            error=f"Failed to parse structured response: {text[:200]}",
         )
 
 
@@ -76,22 +72,20 @@ def load_research_results() -> list[ResearchResult]:
     return results
 
 
-async def classify_company_async(
+async def classify_company(
     research: ResearchResult,
     client: genai.Client,
     semaphore: asyncio.Semaphore,
 ) -> Classification:
     """Classify a single company with rate limiting."""
     async with semaphore:
-        # No search grounding for classification - pure text reasoning
-        config = types.GenerateContentConfig()
         prompt = _build_prompt(research)
 
         try:
             response = await client.aio.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
-                config=config,
+                config=_CLASSIFICATION_CONFIG,
             )
             result = _parse_classification_response(response, research)
         except Exception as e:
@@ -106,9 +100,8 @@ async def classify_company_async(
         output_path = _result_path(research.slug)
         output_path.write_text(result.model_dump_json(indent=2))
 
-        await asyncio.sleep(60 / REQUESTS_PER_MINUTE)
-
-        return result
+    await asyncio.sleep(60 / REQUESTS_PER_MINUTE)
+    return result
 
 
 async def classify_companies(
@@ -119,13 +112,12 @@ async def classify_companies(
     if research_results is None:
         research_results = load_research_results()
 
-    # Filter to only companies where we found an annual report
     valid = [r for r in research_results if r.annual_report_found and not r.error]
     skipped_no_report = len(research_results) - len(valid)
     if skipped_no_report:
         print(f"  Skipping {skipped_no_report} companies (no annual report found)")
 
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    client = genai.Client(vertexai=True, api_key=GOOGLE_API_KEY)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     to_process = []
@@ -144,7 +136,7 @@ async def classify_companies(
     if to_process:
         print(f"\nClassifying {len(to_process)} companies...")
         tasks = [
-            classify_company_async(r, client, semaphore) for r in to_process
+            classify_company(r, client, semaphore) for r in to_process
         ]
         new_results = await asyncio.gather(*tasks)
         results.extend(new_results)

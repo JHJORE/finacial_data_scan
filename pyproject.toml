@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "AI-assisted screening pipeline for identifying programmatic acquirers"
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.13.3",
     "google-genai>=1.67.0",
     "openpyxl>=3.1.5",
     "pandas>=3.0.1",

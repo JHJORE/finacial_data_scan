@@ -1,6 +1,5 @@
 """Validate: Random sample of classifications for manual review."""
 
-import json
 import random
 import sys
 from pathlib import Path

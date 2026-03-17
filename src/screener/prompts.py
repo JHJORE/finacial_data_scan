@@ -1,8 +1,8 @@
 RESEARCH_PROMPT = """Find the most recent annual report (2025 or 2024) for {company_name} (Bloomberg ticker: {ticker}).
 
-Search for the company's annual report, 10-K filing, annual review, or equivalent regulatory filing. Extract the sections that describe the company's strategy, growth model, and approach to acquisitions or M&A.
+Search the company's own investor relations page, SEC EDGAR (for US-listed companies), or the relevant stock exchange filing database. Look for the annual report, 10-K filing, 20-F filing, annual review, or equivalent regulatory filing. Do NOT use press releases, news aggregators, or third-party summaries — only use primary filings from the company or its regulator.
 
-Return verbatim quotes about:
+Extract verbatim quotes about:
 - How the company describes its acquisition/M&A strategy
 - Whether acquisitions are described as a core part of growth
 - Any acquisition model, programme, pipeline, or process mentioned
@@ -10,18 +10,7 @@ Return verbatim quotes about:
 - Number or pace of acquisitions mentioned
 - Any quantitative M&A goals
 
-If you cannot find an annual report, state that clearly and note what sources you did find.
-
-Return a JSON object with these exact keys:
-{{
-  "annual_report_found": true or false,
-  "report_year": the year of the report found (integer or null),
-  "source_urls": ["url1", "url2"],
-  "extracted_text": "the relevant strategy/M&A excerpts as a single string (verbatim quotes preferred)",
-  "company_description": "brief 1-sentence description of what the company does"
-}}
-
-Return ONLY the JSON object, no other text."""
+If you cannot find an annual report, set annual_report_found to false and note what sources you did find in extracted_text."""
 
 
 CLASSIFICATION_PROMPT = """Based ONLY on the following excerpts from {company_name}'s annual report ({year}), classify whether this company is a PROGRAMMATIC ACQUIRER.
@@ -43,12 +32,4 @@ NOT SUFFICIENT on its own:
 - Being a PE-backed company doing bolt-ons
 
 EVIDENCE FROM ANNUAL REPORT:
-{extracted_text}
-
-Return ONLY a JSON object with these exact keys:
-{{
-  "is_programmatic": true or false,
-  "confidence": "high" or "medium" or "low",
-  "evidence": ["direct quote 1 from the text above", "direct quote 2"],
-  "reasoning": "1-3 sentence explanation of your verdict"
-}}"""
+{extracted_text}"""

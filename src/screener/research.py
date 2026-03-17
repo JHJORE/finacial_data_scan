@@ -1,12 +1,10 @@
 """Stage 1: Research - Find annual reports using Gemini + Google Search grounding."""
 
 import asyncio
-import json
-import time
 from pathlib import Path
 
+import aiohttp
 from google import genai
-from google.genai import types
 
 from .config import (
     GEMINI_MODEL,
@@ -15,8 +13,14 @@ from .config import (
     REQUESTS_PER_MINUTE,
     RESEARCH_DIR,
 )
-from .models import Company, ResearchResult
+from .models import Company, GroundingSource, ResearchResponse, ResearchResult
 from .prompts import RESEARCH_PROMPT
+
+_RESEARCH_CONFIG = {
+    "tools": [{"google_search": {}}],
+    "response_mime_type": "application/json",
+    "response_json_schema": ResearchResponse.model_json_schema(),
+}
 
 
 def _build_prompt(company: Company) -> str:
@@ -26,18 +30,20 @@ def _build_prompt(company: Company) -> str:
     )
 
 
-def _extract_grounding_metadata(response) -> tuple[list[str], list[dict]]:
-    """Extract search queries and grounding chunks from Gemini response."""
-    search_queries = []
-    grounding_chunks = []
+def _extract_grounding_metadata(
+    response,
+) -> tuple[list[str], list[GroundingSource]]:
+    """Extract search queries and sources from Gemini grounding metadata."""
+    search_queries: list[str] = []
+    sources: list[GroundingSource] = []
 
     if not hasattr(response, "candidates") or not response.candidates:
-        return search_queries, grounding_chunks
+        return search_queries, sources
 
     candidate = response.candidates[0]
     metadata = getattr(candidate, "grounding_metadata", None)
     if not metadata:
-        return search_queries, grounding_chunks
+        return search_queries, sources
 
     if hasattr(metadata, "web_search_queries") and metadata.web_search_queries:
         search_queries = list(metadata.web_search_queries)
@@ -46,61 +52,77 @@ def _extract_grounding_metadata(response) -> tuple[list[str], list[dict]]:
         for chunk in metadata.grounding_chunks:
             web = getattr(chunk, "web", None)
             if web:
-                grounding_chunks.append(
-                    {"uri": getattr(web, "uri", ""), "title": getattr(web, "title", "")}
-                )
+                uri = getattr(web, "uri", "")
+                title = getattr(web, "title", "")
+                if uri or title:
+                    sources.append(GroundingSource(title=title, url=uri))
 
-    return search_queries, grounding_chunks
+    return search_queries, sources
 
 
-def _parse_research_response(response, company: Company) -> ResearchResult:
-    """Parse Gemini response into a ResearchResult."""
-    search_queries, grounding_chunks = _extract_grounding_metadata(response)
-
-    text = response.text or ""
-
-    # Try to parse JSON from response
+async def _resolve_redirect(
+    session: aiohttp.ClientSession, url: str
+) -> str:
+    """Follow a Vertex AI grounding redirect to get the actual URL."""
+    if "grounding-api-redirect" not in url:
+        return url
     try:
-        # Strip markdown code fences if present
-        clean = text.strip()
-        if clean.startswith("```"):
-            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-            if clean.endswith("```"):
-                clean = clean[:-3]
-            clean = clean.strip()
+        async with session.head(url, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            return str(resp.headers.get("Location", url))
+    except Exception:
+        return url
 
-        data = json.loads(clean)
 
-        source_urls = data.get("source_urls", [])
-        # Also add URLs from grounding chunks
-        for chunk in grounding_chunks:
-            uri = chunk.get("uri", "")
-            if uri and uri not in source_urls:
-                source_urls.append(uri)
+async def _resolve_sources(sources: list[GroundingSource]) -> list[GroundingSource]:
+    """Resolve all Vertex AI redirect URLs to actual source URLs."""
+    if not sources:
+        return sources
+    async with aiohttp.ClientSession() as session:
+        tasks = [_resolve_redirect(session, s.url) for s in sources]
+        resolved = await asyncio.gather(*tasks)
+        return [
+            GroundingSource(title=s.title, url=url)
+            for s, url in zip(sources, resolved)
+        ]
+
+
+async def _parse_research_response(
+    response, company: Company
+) -> ResearchResult:
+    """Parse structured Gemini response into a ResearchResult.
+
+    Source URLs come from grounding metadata (verified Google Search results),
+    not from the model's structured output. Vertex AI returns redirect proxy
+    URLs, so we resolve them to actual source URLs.
+    """
+    search_queries, sources = _extract_grounding_metadata(response)
+    sources = await _resolve_sources(sources)
+    source_urls = [s.url for s in sources if s.url]
+
+    try:
+        data = ResearchResponse.model_validate_json(response.text or "")
 
         return ResearchResult(
             company_name=company.name,
             ticker=company.ticker,
             slug=company.slug,
-            annual_report_found=data.get("annual_report_found", False),
-            report_year=data.get("report_year"),
+            annual_report_found=data.annual_report_found,
+            report_year=data.report_year,
             source_urls=source_urls,
-            extracted_text=data.get("extracted_text", ""),
-            company_description=data.get("company_description", ""),
+            sources=sources,
+            extracted_text=data.extracted_text,
+            company_description=data.company_description,
             search_queries_used=search_queries,
-            grounding_chunks=grounding_chunks,
-            raw_response={"text": text},
         )
-    except (json.JSONDecodeError, AttributeError):
+    except Exception:
         return ResearchResult(
             company_name=company.name,
             ticker=company.ticker,
             slug=company.slug,
-            extracted_text=text,
+            source_urls=source_urls,
+            sources=sources,
             search_queries_used=search_queries,
-            grounding_chunks=grounding_chunks,
-            raw_response={"text": text},
-            error="Failed to parse JSON from response",
+            error="Failed to parse structured response",
         )
 
 
@@ -108,52 +130,20 @@ def _result_path(company: Company) -> Path:
     return RESEARCH_DIR / f"{company.slug}.json"
 
 
-def research_company_sync(company: Company) -> ResearchResult:
-    """Research a single company synchronously."""
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-    tool = types.Tool(google_search=types.GoogleSearch())
-    config = types.GenerateContentConfig(tools=[tool])
-
-    prompt = _build_prompt(company)
-
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=config,
-        )
-        result = _parse_research_response(response, company)
-    except Exception as e:
-        result = ResearchResult(
-            company_name=company.name,
-            ticker=company.ticker,
-            slug=company.slug,
-            error=str(e),
-        )
-
-    # Save result
-    output_path = _result_path(company)
-    output_path.write_text(result.model_dump_json(indent=2))
-
-    return result
-
-
-async def research_company_async(
+async def research_company(
     company: Company, client: genai.Client, semaphore: asyncio.Semaphore
 ) -> ResearchResult:
     """Research a single company with rate limiting."""
     async with semaphore:
-        tool = types.Tool(google_search=types.GoogleSearch())
-        config = types.GenerateContentConfig(tools=[tool])
         prompt = _build_prompt(company)
 
         try:
             response = await client.aio.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
-                config=config,
+                config=_RESEARCH_CONFIG,
             )
-            result = _parse_research_response(response, company)
+            result = await _parse_research_response(response, company)
         except Exception as e:
             result = ResearchResult(
                 company_name=company.name,
@@ -162,21 +152,18 @@ async def research_company_async(
                 error=str(e),
             )
 
-        # Save result
         output_path = _result_path(company)
         output_path.write_text(result.model_dump_json(indent=2))
 
-        # Rate limit pause
-        await asyncio.sleep(60 / REQUESTS_PER_MINUTE)
-
-        return result
+    await asyncio.sleep(60 / REQUESTS_PER_MINUTE)
+    return result
 
 
 async def research_companies(
     companies: list[Company], skip_existing: bool = True
 ) -> list[ResearchResult]:
     """Research multiple companies concurrently with rate limiting."""
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    client = genai.Client(vertexai=True, api_key=GOOGLE_API_KEY)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     to_process = []
@@ -195,7 +182,7 @@ async def research_companies(
     if to_process:
         print(f"\nResearching {len(to_process)} companies...")
         tasks = [
-            research_company_async(c, client, semaphore) for c in to_process
+            research_company(c, client, semaphore) for c in to_process
         ]
         new_results = await asyncio.gather(*tasks)
         results.extend(new_results)

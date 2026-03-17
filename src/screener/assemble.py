@@ -1,6 +1,5 @@
 """Stage 3: Assemble classifications into a company x year matrix."""
 
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +39,7 @@ def assemble_matrix() -> pd.DataFrame:
             {
                 "acquirer": c.company_name,
                 "ticker": c.ticker,
+                "description": r.company_description if r else "",
                 "year": c.year,
                 "is_programmatic": c.is_programmatic,
                 "confidence": c.confidence,
