@@ -4,7 +4,15 @@
 
 Master thesis tool: classify ~1,600 listed companies as **programmatic acquirers** using AI-assisted screening of annual reports.
 
-A **programmatic acquirer** has an explicit, recurring acquisition programme as a core part of its business model. This is distinct from simply having done many acquisitions. The classification must be **ex ante** — only information publicly available at the time (primarily annual reports) may be used.
+A **programmatic acquirer** has an explicit, recurring acquisition programme as a core part of its business model. This is distinct from simply having done many acquisitions. The classification must be **ex ante** — only information publicly available at the time (primarily annual reports) may be used. No hindsight and no use of later reports to classify earlier years.
+
+**Reproducibility is critical**: the extracted evidence (verbatim quotes from the annual report) is stored separately from the verdict, so the ex-ante constraint is verifiable — anyone can inspect exactly what text the classification was based on.
+
+### Quantitative pre-qualification (minimum criteria):
+- At least 5 acquisitions in the last 36 months to enter
+- At least 1 acquisition in the last 12 months to stay in
+- If a company falls out, it must re-qualify again
+- These thresholds are evaluated relative to the annual report year
 
 ### What qualifies as programmatic:
 - Acquisitions/inorganic growth described as a **core growth driver**
@@ -25,33 +33,39 @@ Constellation Software, Lifco, Danaher, Roper Technologies, TransDigm, Addtech, 
 
 ## Architecture
 
-Two-stage pipeline, all using **Gemini 3 Flash** via Google's `google-genai` SDK:
+Two-agent pipeline using **Gemini 3 Flash** via Google's `google-genai` SDK (standard API, not Vertex AI):
 
 ```
 [data/companies.xlsx]           (input: acquirer + ticker columns)
     ↓
-Stage 1: RESEARCH               (Gemini Flash + Google Search grounding)
-    → Find annual report, extract strategy/M&A sections
-    → Output: data/research/{slug}.json (one per company)
+Agent 1: SEARCH                 (Google Search grounding + time_range_filter)
+    → Find best single source URL for the annual report
+    → Output: data/search/{slug}.json
     ↓
-Stage 2: CLASSIFY                (Gemini Flash, no search)
-    → Apply classification criteria to stored evidence
-    → Output: data/classifications/{slug}.json (one per company)
+Agent 2: READER                 (url_context to read the source)
+    → Read the source, extract M&A evidence
+    → Apply quantitative thresholds + qualitative checklist
+    → Output: data/results/{slug}.json
     ↓
-Stage 3: ASSEMBLE
-    → Aggregate into data/output/matrix.csv
+ASSEMBLE
+    → data/output/matrix.csv
 ```
 
-### Why two stages:
-1. Re-run classification with different prompts without re-searching (saves cost)
-2. Raw evidence stored for thesis audit/reproducibility
-3. Ex ante constraint is verifiable — you can inspect what evidence was used
+### Why two agents:
+1. **Search agent** focuses only on finding the best source — source quality is critical
+2. **Reader agent** reads the actual document and classifies — extraction and classification in one pass, but evidence stored separately from verdict for reproducibility
+3. Non-classified companies (no source found, errors) are kept in the output with appropriate flags
+
+### Agent instructions:
+Each agent has a dedicated markdown instruction file in `src/screener/agents/`:
+- `search.md` — instructions for source discovery and selection
+- `reader.md` — instructions for reading, extraction, and classification
 
 ## Tech Stack
 
 - **Python 3.11+** managed with `uv`
-- **google-genai** — Gemini API client with Google Search grounding
-- **pydantic** — data models (Company, ResearchResult, Classification)
+- **google-genai** — Gemini API client (standard API with Google Search grounding)
+- **pydantic** — data models (Company, SearchResult, ReaderResult)
 - **openpyxl** — read company list from Excel
 - **pandas** — assemble output matrix
 
@@ -59,33 +73,38 @@ Stage 3: ASSEMBLE
 
 | File | Purpose |
 |---|---|
-| `src/screener/config.py` | Paths, API keys, model settings, rate limits |
-| `src/screener/models.py` | Pydantic models: Company, ResearchResult, Classification |
-| `src/screener/prompts.py` | Research + classification prompt templates |
+| `src/screener/config.py` | Paths, API keys, model settings, rate limits, client factory |
+| `src/screener/models.py` | Pydantic models: Company, SearchResult, ReaderResult |
+| `src/screener/agents/search.md` | Search agent instructions |
+| `src/screener/agents/reader.md` | Reader agent instructions |
 | `src/screener/companies.py` | Load company list from Excel |
-| `src/screener/research.py` | Stage 1: Gemini + Google Search → find annual reports |
-| `src/screener/classify.py` | Stage 2: Gemini → classify from stored evidence |
-| `src/screener/assemble.py` | Stage 3: build company × year matrix |
-| `scripts/pilot.py` | 50-company test run with known controls |
-| `scripts/run_research.py` | Full Stage 1 run |
-| `scripts/run_classify.py` | Full Stage 2 run + matrix assembly |
-| `scripts/validate.py` | Random sample for manual QA |
+| `src/screener/search.py` | Agent 1: Google Search grounding → find annual report source |
+| `src/screener/reader.py` | Agent 2: url_context → read source, extract, classify |
+| `src/screener/assemble.py` | Build company × year matrix |
+| `scripts/pilot.py` | Sample test run |
+| `scripts/run_search.py` | Full Agent 1 run |
+| `scripts/run_reader.py` | Full Agent 2 run + matrix assembly |
 
 ## Data Flow & Storage
 
-Every company gets a JSON file with full audit trail:
+Every company gets JSON files with full audit trail:
 
-**Research JSON** (`data/research/{slug}.json`):
-- `source_urls` — URLs where information was found
-- `search_queries_used` — what Gemini searched for (from groundingMetadata)
-- `grounding_chunks` — structured citations with URIs and titles
-- `extracted_text` — verbatim quotes from annual report
-- `raw_response` — full API response for debugging
+**Search JSON** (`data/search/{slug}.json`):
+- `source_url` — the single best source URL
+- `source_type` — investor_relations, sec_edgar, stock_exchange, etc.
+- `source_rationale` — why this source was chosen
+- `search_queries_used` — what Gemini searched for
+- `grounding_sources` — all sources returned (for audit)
 
-**Classification JSON** (`data/classifications/{slug}.json`):
+**Reader JSON** (`data/results/{slug}.json`):
+- `extracted_text` — verbatim M&A strategy excerpts (raw evidence, stored separately)
+- `acquisitions_mentioned` — number of acquisitions found
+- `meets_quantitative_threshold` — passes minimum criteria
+- Checklist booleans: `core_growth_driver`, `stated_programme`, `repeated_references`, `clear_processes`, `decentralized_model`, `quantitative_goals`
+- Disqualifiers: `only_high_deal_count`, `only_opportunistic`, `only_single_deal`
 - `is_programmatic` — true/false verdict
 - `confidence` — high/medium/low
-- `evidence` — direct quotes supporting the verdict
+- `evidence` — specific quotes per criterion
 - `reasoning` — 1-3 sentence explanation
 
 ## Input Format
@@ -98,31 +117,30 @@ The Bloomberg exchange suffix (CN = Canada, GR = Germany, SS = Stockholm, US = U
 
 ## Cost & Rate Limits
 
-- Google Search grounding: **1,500 batch requests/day free**, then $14/1,000
-- Gemini Flash tokens (batch): $0.25/MTok input, $1.50/MTok output
-- Estimated total for 1,600 companies (single year): **$13-35**
-- Spread research over 2 days to stay within free search tier
+- Google Search grounding: **5,000 prompts/month free** (Gemini 3), then $14/1,000 search queries
+- Gemini Flash tokens: $0.25/MTok input, $1.50/MTok output
+- Each company requires 2 API calls (search + reader)
 
 ## Running the Pipeline
 
 ```bash
 # 1. Set up
-cp .env.example .env  # add GOOGLE_API_KEY
+cp .env.example .env  # add GOOGLE_API_KEY (from aistudio.google.com)
 
-# 2. Pilot (50 companies, <$3)
+# 2. Pilot (50 companies)
 uv run python scripts/pilot.py
 
 # 3. Full run
-uv run python scripts/run_research.py    # Stage 1
-uv run python scripts/run_classify.py    # Stage 2 + matrix
-
-# 4. Validate
-uv run python scripts/validate.py 20     # review 20 random results
+uv run python scripts/run_search.py     # Agent 1: find sources
+uv run python scripts/run_reader.py     # Agent 2: read + classify + matrix
 ```
 
 ## Design Decisions
 
-- **All-Gemini** chosen over mixed Claude+Gemini approach: Google Search is likely better at finding financial documents than Brave Search (which Claude uses), and Gemini Flash is much cheaper
-- **Agentic search**: Gemini decides its own search queries based on the prompt — no manual query construction needed
-- **Skip-existing**: All scripts skip companies that already have results, enabling safe resume after interruptions
-- **Async with rate limiting**: Research uses asyncio with semaphore for concurrent but rate-limited API calls
+- **Standard Gemini API** (not Vertex AI): enables `time_range_filter` on Google Search to focus on 2024-2025 filings
+- **Two separate agents**: search agent finds sources, reader agent reads and classifies — clear separation of concerns
+- **Agent instructions in markdown**: easier to iterate on prompts than Python string templates
+- **url_context tool**: reader agent reads the actual source document, not just search snippets
+- **Structured output with checklist**: explicit boolean per criterion, not just a single verdict
+- **Skip-existing**: all scripts skip companies that already have results, enabling safe resume
+- **Async with rate limiting**: asyncio with semaphore for concurrent but rate-limited API calls

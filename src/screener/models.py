@@ -15,79 +15,161 @@ class Company(BaseModel):
         return cls(name=name, ticker=ticker, slug=slug)
 
 
-# --- Structured output schemas (sent to Gemini as response_json_schema) ---
-
-
-class ResearchResponse(BaseModel):
-    """Schema for the Gemini research stage structured output.
-
-    Source URLs are NOT included here — they come from grounding metadata,
-    which provides verified URLs from Google Search rather than model-generated ones.
-    """
-
-    annual_report_found: bool = Field(
-        description="Whether an annual report or equivalent filing was found"
-    )
-    report_year: int | None = Field(
-        default=None, description="Year of the annual report found"
-    )
-    extracted_text: str = Field(
-        default="",
-        description="Verbatim strategy/M&A excerpts from the annual report",
-    )
-    company_description: str = Field(
-        default="",
-        description="Brief 1-sentence description of what the company does",
-    )
-
-
-class ClassificationResponse(BaseModel):
-    """Schema for the Gemini classification stage structured output."""
-
-    is_programmatic: bool = Field(
-        description="Whether the company is a programmatic acquirer"
-    )
-    confidence: Literal["high", "medium", "low"] = Field(
-        description="Confidence level of the classification"
-    )
-    evidence: list[str] = Field(
-        default_factory=list,
-        description="Direct quotes from the annual report supporting the verdict",
-    )
-    reasoning: str = Field(
-        default="", description="1-3 sentence explanation of the verdict"
-    )
-
-
-# --- Storage models (persisted to disk as JSON) ---
-
-
 class GroundingSource(BaseModel):
     title: str = ""
     url: str = ""
 
 
-class ResearchResult(BaseModel):
+# --- Search agent schemas ---
+
+
+class SearchResponse(BaseModel):
+    """Structured output schema for the search agent."""
+
+    found: bool = Field(description="Whether an annual report or equivalent filing was found")
+    report_year: int | None = Field(
+        default=None, description="Fiscal year the report covers"
+    )
+    source_type: str = Field(
+        default="",
+        description="Type of source: investor_relations, sec_edgar, stock_exchange, regulatory_filing, other",
+    )
+    source_rationale: str = Field(
+        default="",
+        description="Why this source was chosen as the primary source",
+    )
+
+
+class SearchResult(BaseModel):
+    """Persisted to data/search/{slug}.json."""
+
     company_name: str
     ticker: str
     slug: str
-    annual_report_found: bool = False
+    found: bool = False
     report_year: int | None = None
-    source_urls: list[str] = []
-    sources: list[GroundingSource] = []
-    extracted_text: str = ""
-    company_description: str = ""
+    source_url: str = ""
+    source_type: str = ""
+    source_rationale: str = ""
     search_queries_used: list[str] = []
+    grounding_sources: list[GroundingSource] = []
     error: str | None = None
 
 
-class Classification(BaseModel):
+# --- Reader agent schemas ---
+
+
+class ReaderResponse(BaseModel):
+    """Structured output schema for the reader agent."""
+
+    # Quantitative pre-qualification
+    acquisitions_mentioned: int = Field(
+        default=0, description="Number of acquisitions identifiable from the report"
+    )
+    meets_quantitative_threshold: bool = Field(
+        default=False,
+        description="At least 5 acquisitions in 36 months AND at least 1 in last 12 months",
+    )
+
+    # Qualitative checklist
+    core_growth_driver: bool = Field(
+        default=False,
+        description="Acquisitions/inorganic growth described as a core growth driver",
+    )
+    stated_programme: bool = Field(
+        default=False,
+        description="A stated acquisition model, programme, or pipeline exists",
+    )
+    repeated_references: bool = Field(
+        default=False,
+        description="Repeated references to acquisitions as integral to strategy",
+    )
+    clear_processes: bool = Field(
+        default=False,
+        description="Clear routines/processes for sourcing, evaluating, or integrating targets",
+    )
+    decentralized_model: bool = Field(
+        default=False,
+        description="Decentralized model where acquired companies keep autonomy",
+    )
+    quantitative_goals: bool = Field(
+        default=False,
+        description="Quantitative M&A goals (number per year, % of growth from M&A)",
+    )
+
+    # Disqualifiers
+    only_high_deal_count: bool = Field(
+        default=False,
+        description="Evidence is limited to high deal count without programme language",
+    )
+    only_opportunistic: bool = Field(
+        default=False,
+        description="Only generic wording like 'we consider acquisitions opportunistically'",
+    )
+    only_single_deal: bool = Field(
+        default=False, description="Only mentions one specific deal"
+    )
+
+    # Extracted evidence (stored separately for reproducibility / ex-ante audit)
+    extracted_text: str = Field(
+        default="",
+        description="ALL verbatim M&A strategy excerpts from the annual report",
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="Specific quotes supporting each positive criterion marked true",
+    )
+
+    # Verdict
+    is_programmatic: bool = Field(
+        default=False, description="Final classification: is this a programmatic acquirer?"
+    )
+    confidence: Literal["high", "medium", "low"] = Field(
+        default="low", description="Confidence level of the classification"
+    )
+    reasoning: str = Field(
+        default="",
+        description="1-3 sentence explanation referencing which criteria were met",
+    )
+    company_description: str = Field(
+        default="", description="1-sentence description of what the company does"
+    )
+
+
+class ReaderResult(BaseModel):
+    """Persisted to data/results/{slug}.json.
+
+    The extracted_text field stores the raw evidence separately from the
+    verdict, so the ex-ante constraint is verifiable — anyone can inspect
+    exactly what text the classification was based on.
+    """
+
     company_name: str
     ticker: str
     slug: str
     year: int | None = None
+    source_url: str = ""
+    source_type: str = ""
+    # Quantitative
+    acquisitions_mentioned: int = 0
+    meets_quantitative_threshold: bool = False
+    # Qualitative checklist
+    core_growth_driver: bool = False
+    stated_programme: bool = False
+    repeated_references: bool = False
+    clear_processes: bool = False
+    decentralized_model: bool = False
+    quantitative_goals: bool = False
+    # Disqualifiers
+    only_high_deal_count: bool = False
+    only_opportunistic: bool = False
+    only_single_deal: bool = False
+    # Evidence
+    extracted_text: str = ""
+    evidence: list[str] = []
+    # Verdict
     is_programmatic: bool = False
     confidence: str = "low"
-    evidence: list[str] = []
     reasoning: str = ""
+    company_description: str = ""
     error: str | None = None
