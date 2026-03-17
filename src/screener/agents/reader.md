@@ -54,9 +54,9 @@ Set `is_programmatic` to true ONLY if:
 3. The evidence is not limited to disqualifiers only
 
 Set `confidence` to:
-- `high`: 3+ positive criteria clearly met, strong verbatim evidence
-- `medium`: 2 positive criteria met, or evidence is somewhat ambiguous
-- `low`: borderline case, limited evidence
+- `high`: 5+ positive criteria clearly met, explicit programme language, strong verbatim evidence
+- `medium`: 3–4 positive criteria met with reasonable evidence
+- `low`: meets the minimum threshold (2 criteria) but evidence is thin or ambiguous
 
 Set `reasoning` to a 1-3 sentence explanation referencing which criteria were met or not met.
 

@@ -15,20 +15,25 @@ class Company(BaseModel):
         return cls(name=name, ticker=ticker, slug=slug)
 
 
-class GroundingSource(BaseModel):
-    title: str = ""
-    url: str = ""
-
-
 # --- Search agent schemas ---
 
 
 class SearchResponse(BaseModel):
     """Structured output schema for the search agent."""
 
-    found: bool = Field(description="Whether an annual report or equivalent filing was found")
+    status: Literal["found", "not_found", "not_applicable"] = Field(
+        description=(
+            "'found' if an annual report was located, "
+            "'not_applicable' if the company was acquired/merged/delisted and no longer files independently, "
+            "'not_found' if no report could be located"
+        )
+    )
     report_year: int | None = Field(
         default=None, description="Fiscal year the report covers"
+    )
+    source_url: str = Field(
+        default="",
+        description="The direct URL to the annual report filing page or PDF",
     )
     source_type: str = Field(
         default="",
@@ -46,13 +51,12 @@ class SearchResult(BaseModel):
     company_name: str
     ticker: str
     slug: str
-    found: bool = False
+    status: Literal["found", "not_found", "not_applicable"] = "not_found"
     report_year: int | None = None
     source_url: str = ""
     source_type: str = ""
     source_rationale: str = ""
     search_queries_used: list[str] = []
-    grounding_sources: list[GroundingSource] = []
     error: str | None = None
 
 
@@ -172,4 +176,7 @@ class ReaderResult(BaseModel):
     confidence: str = "low"
     reasoning: str = ""
     company_description: str = ""
+    # URL context verification
+    url_retrieval_status: str = ""
+    document_token_count: int = 0
     error: str | None = None

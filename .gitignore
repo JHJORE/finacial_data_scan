@@ -3,6 +3,4 @@
 __pycache__/
 *.pyc
 .context/
-data/research/
-data/classifications/
-data/output/
+data/runs/

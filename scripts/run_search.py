@@ -7,11 +7,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from screener.companies import load_companies
-from screener.config import COMPANIES_FILE
+from screener.config import COMPANIES_FILE, init_run
 from screener.search import search_companies
 
 
 async def main():
+    init_run(create_new=True)
+
     if not COMPANIES_FILE.exists():
         print(f"ERROR: Company list not found at {COMPANIES_FILE}")
         sys.exit(1)
@@ -21,9 +23,10 @@ async def main():
 
     results = await search_companies(companies, skip_existing=True)
 
-    found = sum(1 for r in results if r.found)
+    found = sum(1 for r in results if r.status == "found")
+    na = sum(1 for r in results if r.status == "not_applicable")
     errors = sum(1 for r in results if r.error)
-    print(f"\nDone: {found}/{len(results)} sources found, {errors} errors")
+    print(f"\nDone: {found}/{len(results)} found, {na} not applicable, {errors} errors")
 
 
 if __name__ == "__main__":

@@ -6,12 +6,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from screener.config import RESULTS_DIR, SEARCH_DIR
+from screener import config
 from screener.models import ReaderResult, SearchResult
 
 
 def validate(n: int = 10, seed: int = 42):
-    result_files = sorted(RESULTS_DIR.glob("*.json"))
+    result_files = sorted(config.RESULTS_DIR.glob("*.json"))
 
     if not result_files:
         print("No results found. Run the pipeline first.")
@@ -24,7 +24,7 @@ def validate(n: int = 10, seed: int = 42):
         r = ReaderResult.model_validate_json(path.read_text())
 
         # Load corresponding search result
-        search_path = SEARCH_DIR / f"{r.slug}.json"
+        search_path = config.SEARCH_DIR / f"{r.slug}.json"
         s = None
         if search_path.exists():
             s = SearchResult.model_validate_json(search_path.read_text())

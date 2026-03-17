@@ -33,16 +33,16 @@ Constellation Software, Lifco, Danaher, Roper Technologies, TransDigm, Addtech, 
 
 ## Architecture
 
-Two-agent pipeline using **Gemini 3 Flash** via Google's `google-genai` SDK (standard API, not Vertex AI):
+Two-agent pipeline using **Gemini 3 Flash** (`gemini-3-flash-preview`) via Google's `google-genai` SDK (standard Gemini AI Studio API, not Vertex AI):
 
 ```
 [data/companies.xlsx]           (input: acquirer + ticker columns)
     ↓
-Agent 1: SEARCH                 (Google Search grounding + time_range_filter)
+Agent 1: SEARCH                 (two-step: Google Search grounding → structured output)
     → Find best single source URL for the annual report
     → Output: data/search/{slug}.json
     ↓
-Agent 2: READER                 (url_context to read the source)
+Agent 2: READER                 (url_context + structured output)
     → Read the source, extract M&A evidence
     → Apply quantitative thresholds + qualitative checklist
     → Output: data/results/{slug}.json
@@ -51,10 +51,23 @@ ASSEMBLE
     → data/output/matrix.csv
 ```
 
+### Why the search agent uses two API calls:
+
+Gemini cannot combine Google Search grounding with structured JSON output in the same request. The search agent works around this with two calls per company:
+
+1. **Grounding call** — uses `google_search` tool, no structured output. Gemini runs real web searches and returns free-text findings.
+2. **Structure call** — uses `response_json_schema`, no grounding. Takes the free-text search results and formats them into the `SearchResponse` JSON schema.
+
+The `source_url` comes from the model's structured output (not from grounding metadata). The search prompt prioritises SEC EDGAR for US-listed companies.
+
 ### Why two agents:
 1. **Search agent** focuses only on finding the best source — source quality is critical
 2. **Reader agent** reads the actual document and classifies — extraction and classification in one pass, but evidence stored separately from verdict for reproducibility
 3. Non-classified companies (no source found, errors) are kept in the output with appropriate flags
+
+### Parallel streaming pipeline:
+
+`pilot.py` runs all companies in parallel. Each company goes through search → reader back-to-back as a single pipeline — as soon as a search completes, the reader starts immediately for that company. Concurrency is controlled by a shared `asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)`.
 
 ### Agent instructions:
 Each agent has a dedicated markdown instruction file in `src/screener/agents/`:
@@ -65,7 +78,7 @@ Each agent has a dedicated markdown instruction file in `src/screener/agents/`:
 
 - **Python 3.11+** managed with `uv`
 - **google-genai** — Gemini API client (standard API with Google Search grounding)
-- **pydantic** — data models (Company, SearchResult, ReaderResult)
+- **pydantic** — data models (Company, SearchResponse, SearchResult, ReaderResponse, ReaderResult)
 - **openpyxl** — read company list from Excel
 - **pandas** — assemble output matrix
 
@@ -74,27 +87,28 @@ Each agent has a dedicated markdown instruction file in `src/screener/agents/`:
 | File | Purpose |
 |---|---|
 | `src/screener/config.py` | Paths, API keys, model settings, rate limits, client factory |
-| `src/screener/models.py` | Pydantic models: Company, SearchResult, ReaderResult |
+| `src/screener/models.py` | Pydantic models: Company, SearchResponse, SearchResult, ReaderResponse, ReaderResult |
 | `src/screener/agents/search.md` | Search agent instructions |
 | `src/screener/agents/reader.md` | Reader agent instructions |
 | `src/screener/companies.py` | Load company list from Excel |
-| `src/screener/search.py` | Agent 1: Google Search grounding → find annual report source |
+| `src/screener/search.py` | Agent 1: two-step Google Search grounding → structured output |
 | `src/screener/reader.py` | Agent 2: url_context → read source, extract, classify |
 | `src/screener/assemble.py` | Build company × year matrix |
-| `scripts/pilot.py` | Sample test run |
-| `scripts/run_search.py` | Full Agent 1 run |
-| `scripts/run_reader.py` | Full Agent 2 run + matrix assembly |
+| `scripts/pilot.py` | Streaming parallel pipeline (search → read per company) |
+| `scripts/run_search.py` | Batch Agent 1 run (search only) |
+| `scripts/run_reader.py` | Batch Agent 2 run + matrix assembly |
+| `scripts/run_assemble.py` | Matrix assembly only (no API calls) |
+| `scripts/validate.py` | Random sample for manual review |
 
 ## Data Flow & Storage
 
 Every company gets JSON files with full audit trail:
 
 **Search JSON** (`data/search/{slug}.json`):
-- `source_url` — the single best source URL
-- `source_type` — investor_relations, sec_edgar, stock_exchange, etc.
+- `source_url` — the single best source URL (from model output, not grounding metadata)
+- `source_type` — investor_relations, sec_edgar, stock_exchange, regulatory_filing, other
 - `source_rationale` — why this source was chosen
-- `search_queries_used` — what Gemini searched for
-- `grounding_sources` — all sources returned (for audit)
+- `search_queries_used` — what Gemini searched for (from grounding metadata)
 
 **Reader JSON** (`data/results/{slug}.json`):
 - `extracted_text` — verbatim M&A strategy excerpts (raw evidence, stored separately)
@@ -106,6 +120,7 @@ Every company gets JSON files with full audit trail:
 - `confidence` — high/medium/low
 - `evidence` — specific quotes per criterion
 - `reasoning` — 1-3 sentence explanation
+- `company_description` — 1-sentence description of what the company does
 
 ## Input Format
 
@@ -119,7 +134,9 @@ The Bloomberg exchange suffix (CN = Canada, GR = Germany, SS = Stockholm, US = U
 
 - Google Search grounding: **5,000 prompts/month free** (Gemini 3), then $14/1,000 search queries
 - Gemini Flash tokens: $0.25/MTok input, $1.50/MTok output
-- Each company requires 2 API calls (search + reader)
+- Each company requires **3 API calls**: search grounding + search structuring + reader
+- `MAX_CONCURRENT_REQUESTS = 5` — up to 5 companies processed in parallel
+- Both agents retry up to 3 times with exponential backoff (20s, 40s, 80s) on 429/RESOURCE_EXHAUSTED errors
 
 ## Running the Pipeline
 
@@ -127,20 +144,22 @@ The Bloomberg exchange suffix (CN = Canada, GR = Germany, SS = Stockholm, US = U
 # 1. Set up
 cp .env.example .env  # add GOOGLE_API_KEY (from aistudio.google.com)
 
-# 2. Pilot (50 companies)
-uv run python scripts/pilot.py
+# 2. Pilot (default 50 companies, or pass a number)
+uv run python scripts/pilot.py       # all 50
+uv run python scripts/pilot.py 5     # just 5
 
-# 3. Full run
+# 3. Full run (two separate scripts, or use pilot.py)
 uv run python scripts/run_search.py     # Agent 1: find sources
 uv run python scripts/run_reader.py     # Agent 2: read + classify + matrix
 ```
 
 ## Design Decisions
 
-- **Standard Gemini API** (not Vertex AI): enables `time_range_filter` on Google Search to focus on 2024-2025 filings
+- **Standard Gemini AI Studio API** (not Vertex AI): simpler auth, single API key
+- **Two-step search**: grounding and structured output cannot be combined in Gemini, so the search agent makes two calls per company
 - **Two separate agents**: search agent finds sources, reader agent reads and classifies — clear separation of concerns
 - **Agent instructions in markdown**: easier to iterate on prompts than Python string templates
 - **url_context tool**: reader agent reads the actual source document, not just search snippets
 - **Structured output with checklist**: explicit boolean per criterion, not just a single verdict
 - **Skip-existing**: all scripts skip companies that already have results, enabling safe resume
-- **Async with rate limiting**: asyncio with semaphore for concurrent but rate-limited API calls
+- **Async with semaphore**: `asyncio.gather` for true parallelism, semaphore for concurrency control, no artificial per-request sleep

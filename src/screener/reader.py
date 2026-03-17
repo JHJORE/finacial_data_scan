@@ -6,15 +6,8 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-from .config import (
-    AGENTS_DIR,
-    GEMINI_MODEL,
-    MAX_CONCURRENT_REQUESTS,
-    REQUESTS_PER_MINUTE,
-    RESULTS_DIR,
-    SEARCH_DIR,
-    create_gemini_client,
-)
+from . import config
+from .config import AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS, create_gemini_client
 from .models import ReaderResponse, ReaderResult, SearchResult
 
 _INSTRUCTIONS = (AGENTS_DIR / "reader.md").read_text()
@@ -37,11 +30,29 @@ def _build_prompt(search: SearchResult) -> str:
     )
 
 
+def _extract_url_metadata(response) -> tuple[str, int]:
+    """Extract url_retrieval_status and document token count from the response."""
+    retrieval_status = ""
+    if hasattr(response, "candidates") and response.candidates:
+        url_meta = getattr(response.candidates[0], "url_context_metadata", None)
+        if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
+            raw_status = url_meta.url_metadata[0].url_retrieval_status
+            retrieval_status = str(raw_status).rsplit(".", 1)[-1] if raw_status else ""
+
+    tool_tokens = 0
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        tool_tokens = getattr(usage, "tool_use_prompt_token_count", 0) or 0
+
+    return retrieval_status, tool_tokens
+
+
 def _parse_reader_response(
     response, search: SearchResult
 ) -> ReaderResult:
     """Parse structured Gemini response into a ReaderResult."""
     text = response.text or ""
+    retrieval_status, tool_tokens = _extract_url_metadata(response)
 
     try:
         data = ReaderResponse.model_validate_json(text)
@@ -70,6 +81,8 @@ def _parse_reader_response(
             confidence=data.confidence,
             reasoning=data.reasoning,
             company_description=data.company_description,
+            url_retrieval_status=retrieval_status,
+            document_token_count=tool_tokens,
         )
     except Exception:
         return ReaderResult(
@@ -79,18 +92,20 @@ def _parse_reader_response(
             year=search.report_year,
             source_url=search.source_url,
             source_type=search.source_type,
+            url_retrieval_status=retrieval_status,
+            document_token_count=tool_tokens,
             error=f"Failed to parse structured response: {text[:200]}",
         )
 
 
 def _result_path(slug: str) -> Path:
-    return RESULTS_DIR / f"{slug}.json"
+    return config.RESULTS_DIR / f"{slug}.json"
 
 
 def load_search_results() -> list[SearchResult]:
     """Load all search results from disk."""
     results = []
-    for path in sorted(SEARCH_DIR.glob("*.json")):
+    for path in sorted(config.SEARCH_DIR.glob("*.json")):
         result = SearchResult.model_validate_json(path.read_text())
         results.append(result)
     return results
@@ -100,34 +115,51 @@ async def read_company(
     search: SearchResult,
     client: genai.Client,
     semaphore: asyncio.Semaphore,
+    max_retries: int = 3,
 ) -> ReaderResult:
-    """Read and classify a single company with rate limiting."""
+    """Read and classify a single company with rate limiting and retries."""
     async with semaphore:
         prompt = _build_prompt(search)
 
-        try:
-            response = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=_READER_CONFIG,
-            )
-            result = _parse_reader_response(response, search)
-        except Exception as e:
-            result = ReaderResult(
-                company_name=search.company_name,
-                ticker=search.ticker,
-                slug=search.slug,
-                year=search.report_year,
-                source_url=search.source_url,
-                source_type=search.source_type,
-                error=str(e),
-            )
+        for attempt in range(max_retries):
+            try:
+                response = await client.aio.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=_READER_CONFIG,
+                )
+                result = _parse_reader_response(response, search)
+                tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
+                tokens = f"{result.document_token_count:,} tokens read"
+                print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) [{tokens}]")
+                if result.url_retrieval_status and "SUCCESS" not in result.url_retrieval_status:
+                    print(f"  [WARN] {search.company_name}: URL retrieval status: {result.url_retrieval_status}")
+                if 0 < result.document_token_count < 5_000:
+                    print(f"  [WARN] {search.company_name}: Very few tokens read ({result.document_token_count}) — may not be the full filing")
+                break
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1) * 10
+                    print(f"  [rate limit] {search.company_name} — retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                    continue
+                print(f"  [ERROR] {search.company_name}: {error_str}")
+                result = ReaderResult(
+                    company_name=search.company_name,
+                    ticker=search.ticker,
+                    slug=search.slug,
+                    year=search.report_year,
+                    source_url=search.source_url,
+                    source_type=search.source_type,
+                    error=error_str,
+                )
+                break
 
         output_path = _result_path(search.slug)
         output_path.write_text(result.model_dump_json(indent=2))
-
-    await asyncio.sleep(60 / REQUESTS_PER_MINUTE)
-    return result
+        return result
 
 
 async def read_companies(
@@ -138,10 +170,10 @@ async def read_companies(
     if search_results is None:
         search_results = load_search_results()
 
-    valid = [r for r in search_results if r.found and not r.error]
-    skipped_no_source = len(search_results) - len(valid)
-    if skipped_no_source:
-        print(f"  Skipping {skipped_no_source} companies (no source found)")
+    valid = [r for r in search_results if r.status == "found" and not r.error]
+    skipped = len(search_results) - len(valid)
+    if skipped:
+        print(f"  Skipping {skipped} companies (not found / not applicable / error)")
 
     client = create_gemini_client()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)

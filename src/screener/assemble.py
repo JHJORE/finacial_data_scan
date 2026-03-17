@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import OUTPUT_DIR, RESULTS_DIR, SEARCH_DIR
+from . import config
 from .models import ReaderResult, SearchResult
 
 
 def load_all_search() -> dict[str, SearchResult]:
     results = {}
-    for path in sorted(SEARCH_DIR.glob("*.json")):
+    for path in sorted(config.SEARCH_DIR.glob("*.json")):
         result = SearchResult.model_validate_json(path.read_text())
         results[result.slug] = result
     return results
@@ -18,7 +18,7 @@ def load_all_search() -> dict[str, SearchResult]:
 
 def load_all_results() -> list[ReaderResult]:
     results = []
-    for path in sorted(RESULTS_DIR.glob("*.json")):
+    for path in sorted(config.RESULTS_DIR.glob("*.json")):
         result = ReaderResult.model_validate_json(path.read_text())
         results.append(result)
     return results
@@ -39,9 +39,13 @@ def assemble_matrix() -> pd.DataFrame:
 
         rows.append(
             {
+                "is_programmatic": r.is_programmatic,
                 "acquirer": r.company_name,
                 "ticker": r.ticker,
-                "description": r.company_description,
+                "description": r.company_description or (
+                    f"Description unavailable – reader error: {r.error}" if r.error
+                    else "Description unavailable"
+                ),
                 "year": r.year,
                 "source_url": r.source_url,
                 "source_type": r.source_type,
@@ -60,11 +64,13 @@ def assemble_matrix() -> pd.DataFrame:
                 "only_opportunistic": r.only_opportunistic,
                 "only_single_deal": r.only_single_deal,
                 # Verdict
-                "is_programmatic": r.is_programmatic,
                 "confidence": r.confidence,
                 "reasoning": r.reasoning,
                 "evidence": " | ".join(r.evidence),
                 "search_queries": "; ".join(s.search_queries_used) if s else "",
+                "status": "found",
+                "url_retrieval_status": r.url_retrieval_status,
+                "document_token_count": r.document_token_count,
                 "error": r.error or "",
             }
         )
@@ -72,11 +78,16 @@ def assemble_matrix() -> pd.DataFrame:
     # Include companies where search found nothing (not classified)
     for slug, s in search_results.items():
         if slug not in seen_slugs:
+            desc = s.source_rationale
+            if s.status == "not_applicable":
+                desc = f"ACQUIRED: {desc}" if desc else "ACQUIRED"
+
             rows.append(
                 {
+                    "is_programmatic": False,
                     "acquirer": s.company_name,
                     "ticker": s.ticker,
-                    "description": "",
+                    "description": desc,
                     "year": s.report_year,
                     "source_url": s.source_url,
                     "source_type": s.source_type,
@@ -91,25 +102,31 @@ def assemble_matrix() -> pd.DataFrame:
                     "only_high_deal_count": False,
                     "only_opportunistic": False,
                     "only_single_deal": False,
-                    "is_programmatic": False,
                     "confidence": "",
-                    "reasoning": "No annual report found" if not s.found else "",
+                    "reasoning": {
+                        "found": "",
+                        "not_found": "No annual report found",
+                        "not_applicable": "Company no longer files independently",
+                    }[s.status],
                     "evidence": "",
                     "search_queries": "; ".join(s.search_queries_used),
-                    "error": s.error or ("No annual report found" if not s.found else ""),
+                    "status": s.status,
+                    "url_retrieval_status": "",
+                    "document_token_count": 0,
+                    "error": s.error or "",
                 }
             )
 
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        df = df.sort_values(["acquirer", "year"]).reset_index(drop=True)
+        df = df.sort_values(["is_programmatic", "acquirer", "year"], ascending=[False, True, True]).reset_index(drop=True)
 
     return df
 
 
 def save_matrix(df: pd.DataFrame, filename: str = "matrix.csv") -> Path:
-    output_path = OUTPUT_DIR / filename
+    output_path = config.OUTPUT_DIR / filename
     df.to_csv(output_path, index=False)
     return output_path
 
@@ -120,25 +137,31 @@ def print_summary(df: pd.DataFrame) -> None:
         print("No results found.")
         return
 
-    has_source = df["source_url"].astype(bool).sum()
+    classified = df[df["status"] == "found"] if "status" in df.columns else df
+    not_applicable = (df["status"] == "not_applicable").sum() if "status" in df.columns else 0
+    not_found = (df["status"] == "not_found").sum() if "status" in df.columns else 0
+
     programmatic = df["is_programmatic"].sum()
-    not_programmatic = total - programmatic
 
     print(f"\n{'='*60}")
     print("SCREENING SUMMARY")
     print(f"{'='*60}")
     print(f"Total companies:            {total}")
-    print(f"Sources found:              {has_source}")
-    print(f"Programmatic acquirers:     {programmatic} ({programmatic/total*100:.1f}%)")
-    print(f"Not programmatic:           {not_programmatic} ({not_programmatic/total*100:.1f}%)")
+    print(f"Classified:                 {len(classified)}")
+    if not_applicable:
+        print(f"Not applicable:             {not_applicable}")
+    if not_found:
+        print(f"Not found:                  {not_found}")
+    print(f"Programmatic acquirers:     {programmatic}")
+    print(f"Not programmatic:           {len(classified) - programmatic}")
 
     if "confidence" in df.columns:
-        classified = df[df["confidence"] != ""]
-        if len(classified) > 0:
-            print(f"\nConfidence distribution (of {len(classified)} classified):")
+        has_confidence = classified[classified["confidence"] != ""]
+        if len(has_confidence) > 0:
+            print(f"\nConfidence distribution (of {len(has_confidence)} classified):")
             for level in ["high", "medium", "low"]:
-                count = (classified["confidence"] == level).sum()
-                print(f"  {level:8s}: {count} ({count/len(classified)*100:.1f}%)")
+                count = (has_confidence["confidence"] == level).sum()
+                print(f"  {level:8s}: {count} ({count/len(has_confidence)*100:.1f}%)")
 
     errors = df["error"].astype(bool).sum()
     if errors:

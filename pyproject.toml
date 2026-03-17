@@ -2,6 +2,7 @@
 name = "screener"
 version = "0.1.0"
 description = "AI-assisted screening pipeline for identifying programmatic acquirers"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.13.3",
@@ -11,3 +12,6 @@ dependencies = [
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",
 ]
+
+[project.scripts]
+screener = "main:main"
