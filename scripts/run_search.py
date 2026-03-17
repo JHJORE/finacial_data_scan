@@ -1,4 +1,4 @@
-"""Run Stage 1: Research all companies."""
+"""Run Agent 1: Search for annual reports for all companies."""
 
 import asyncio
 import sys
@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from screener.companies import load_companies
 from screener.config import COMPANIES_FILE
-from screener.research import research_companies
+from screener.search import search_companies
 
 
 async def main():
@@ -19,11 +19,11 @@ async def main():
     companies = load_companies(COMPANIES_FILE)
     print(f"Loaded {len(companies)} companies")
 
-    results = await research_companies(companies, skip_existing=True)
+    results = await search_companies(companies, skip_existing=True)
 
-    found = sum(1 for r in results if r.annual_report_found)
+    found = sum(1 for r in results if r.found)
     errors = sum(1 for r in results if r.error)
-    print(f"\nDone: {found}/{len(results)} reports found, {errors} errors")
+    print(f"\nDone: {found}/{len(results)} sources found, {errors} errors")
 
 
 if __name__ == "__main__":

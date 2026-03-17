@@ -9,8 +9,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from screener.companies import load_companies
 from screener.config import COMPANIES_FILE
-from screener.research import research_companies
-from screener.classify import classify_companies
+from screener.search import search_companies
+from screener.reader import read_companies
 from screener.assemble import assemble_matrix, print_summary, save_matrix
 
 
@@ -29,29 +29,33 @@ async def main():
     pilot = random.sample(all_companies, min(n, len(all_companies)))
     print(f"Pilot set: {len(pilot)} companies (random sample)")
 
-    # Stage 1: Research
+    # Agent 1: Search
     print(f"\n{'='*60}")
-    print("STAGE 1: RESEARCH")
+    print("AGENT 1: SEARCH")
     print(f"{'='*60}")
-    research_results = await research_companies(pilot, skip_existing=True)
+    search_results = await search_companies(pilot, skip_existing=True)
 
-    found = sum(1 for r in research_results if r.annual_report_found)
-    errors = sum(1 for r in research_results if r.error)
-    print(f"\nResearch: {found}/{len(research_results)} reports found, {errors} errors")
+    found = sum(1 for r in search_results if r.found)
+    errors = sum(1 for r in search_results if r.error)
+    print(f"\nSearch: {found}/{len(search_results)} sources found, {errors} errors")
 
-    # Stage 2: Classify
+    for r in search_results:
+        status = "found" if r.found else "NOT FOUND"
+        print(f"  [{status}] {r.company_name}: {r.source_type} — {r.source_rationale[:60]}")
+
+    # Agent 2: Reader
     print(f"\n{'='*60}")
-    print("STAGE 2: CLASSIFY")
+    print("AGENT 2: READER")
     print(f"{'='*60}")
-    classifications = await classify_companies(research_results, skip_existing=True)
+    reader_results = await read_companies(search_results, skip_existing=True)
 
-    for c in classifications:
-        tag = "PROGRAMMATIC" if c.is_programmatic else "not programmatic"
-        print(f"  [{tag}] ({c.confidence}) {c.company_name}: {c.reasoning[:80]}")
+    for r in reader_results:
+        tag = "PROGRAMMATIC" if r.is_programmatic else "not programmatic"
+        print(f"  [{tag}] ({r.confidence}) {r.company_name}: {r.reasoning[:80]}")
 
-    # Stage 3: Assemble
+    # Assemble
     print(f"\n{'='*60}")
-    print("STAGE 3: ASSEMBLE")
+    print("ASSEMBLE")
     print(f"{'='*60}")
     df = assemble_matrix()
     output = save_matrix(df, "pilot_matrix.csv")

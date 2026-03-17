@@ -1,4 +1,4 @@
-"""Run Stage 3: Assemble matrix from existing classifications."""
+"""Assemble matrix from existing search + reader results."""
 
 import sys
 from pathlib import Path
