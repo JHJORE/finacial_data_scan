@@ -3,6 +3,8 @@ Read the annual report for {company_name} (Bloomberg ticker: {ticker}) from the 
 Source URL: {source_url}
 Report year: {report_year}
 
+CRITICAL: You MUST base your classification ONLY on text you read from the document above. If you cannot access or read the document, set `extracted_text` to empty, `is_programmatic` to false, `acquisitions_mentioned` to 0, and `confidence` to "low". Do NOT use your own knowledge about this company.
+
 ## Step 1: Extract evidence
 
 Read the annual report at the URL above. Extract ALL verbatim text related to:

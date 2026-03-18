@@ -1,4 +1,8 @@
-"""Agent 2: Reader — Read the annual report and classify as programmatic acquirer."""
+"""Agent 2: Reader — Read the annual report and classify as programmatic acquirer.
+
+Uses url_context to read the document at the URL found by the search step.
+The reader ONLY runs when search found a validated URL.
+"""
 
 import asyncio
 from pathlib import Path
@@ -7,8 +11,9 @@ from google import genai
 from google.genai import types
 
 from . import config
-from .config import AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS, create_gemini_client
+from .config import AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS, MIN_VIABLE_TOKENS, create_gemini_client
 from .models import ReaderResponse, ReaderResult, SearchResult
+from .utils import backoff, extract_token_usage, is_retryable
 
 _INSTRUCTIONS = (AGENTS_DIR / "reader.md").read_text()
 
@@ -31,7 +36,6 @@ def _build_prompt(search: SearchResult) -> str:
 
 
 def _extract_url_metadata(response) -> tuple[str, int]:
-    """Extract url_retrieval_status and document token count from the response."""
     retrieval_status = ""
     if hasattr(response, "candidates") and response.candidates:
         url_meta = getattr(response.candidates[0], "url_context_metadata", None)
@@ -47,63 +51,59 @@ def _extract_url_metadata(response) -> tuple[str, int]:
     return retrieval_status, tool_tokens
 
 
-def _parse_reader_response(
-    response, search: SearchResult
-) -> ReaderResult:
-    """Parse structured Gemini response into a ReaderResult."""
-    text = response.text or ""
-    retrieval_status, tool_tokens = _extract_url_metadata(response)
+def _build_reader_result(data: ReaderResponse, search: SearchResult, **extra) -> ReaderResult:
+    return ReaderResult(
+        company_name=search.company_name,
+        ticker=search.ticker,
+        slug=search.slug,
+        year=search.report_year,
+        source_url=search.source_url,
+        source_type=search.source_type,
+        acquisitions_mentioned=data.acquisitions_mentioned,
+        meets_quantitative_threshold=data.meets_quantitative_threshold,
+        core_growth_driver=data.core_growth_driver,
+        stated_programme=data.stated_programme,
+        repeated_references=data.repeated_references,
+        clear_processes=data.clear_processes,
+        decentralized_model=data.decentralized_model,
+        quantitative_goals=data.quantitative_goals,
+        only_high_deal_count=data.only_high_deal_count,
+        only_opportunistic=data.only_opportunistic,
+        only_single_deal=data.only_single_deal,
+        extracted_text=data.extracted_text,
+        evidence=data.evidence,
+        is_programmatic=data.is_programmatic,
+        confidence=data.confidence,
+        reasoning=data.reasoning,
+        company_description=data.company_description,
+        **extra,
+    )
 
-    try:
-        data = ReaderResponse.model_validate_json(text)
 
-        return ReaderResult(
-            company_name=search.company_name,
-            ticker=search.ticker,
-            slug=search.slug,
-            year=search.report_year,
-            source_url=search.source_url,
-            source_type=search.source_type,
-            acquisitions_mentioned=data.acquisitions_mentioned,
-            meets_quantitative_threshold=data.meets_quantitative_threshold,
-            core_growth_driver=data.core_growth_driver,
-            stated_programme=data.stated_programme,
-            repeated_references=data.repeated_references,
-            clear_processes=data.clear_processes,
-            decentralized_model=data.decentralized_model,
-            quantitative_goals=data.quantitative_goals,
-            only_high_deal_count=data.only_high_deal_count,
-            only_opportunistic=data.only_opportunistic,
-            only_single_deal=data.only_single_deal,
-            extracted_text=data.extracted_text,
-            evidence=data.evidence,
-            is_programmatic=data.is_programmatic,
-            confidence=data.confidence,
-            reasoning=data.reasoning,
-            company_description=data.company_description,
-            url_retrieval_status=retrieval_status,
-            document_token_count=tool_tokens,
-        )
-    except Exception:
-        return ReaderResult(
-            company_name=search.company_name,
-            ticker=search.ticker,
-            slug=search.slug,
-            year=search.report_year,
-            source_url=search.source_url,
-            source_type=search.source_type,
-            url_retrieval_status=retrieval_status,
-            document_token_count=tool_tokens,
-            error=f"Failed to parse structured response: {text[:200]}",
-        )
+def _failed_result(search: SearchResult, total_in: int, total_out: int) -> ReaderResult:
+    return ReaderResult(
+        company_name=search.company_name,
+        ticker=search.ticker,
+        slug=search.slug,
+        year=search.report_year,
+        source_url=search.source_url,
+        source_type=search.source_type,
+        total_input_tokens=total_in,
+        total_output_tokens=total_out,
+        error="not_found_correct_document",
+    )
 
 
 def _result_path(slug: str) -> Path:
     return config.RESULTS_DIR / f"{slug}.json"
 
 
+def _save_result(result: ReaderResult) -> None:
+    output_path = _result_path(result.slug)
+    output_path.write_text(result.model_dump_json(indent=2))
+
+
 def load_search_results() -> list[SearchResult]:
-    """Load all search results from disk."""
     results = []
     for path in sorted(config.SEARCH_DIR.glob("*.json")):
         result = SearchResult.model_validate_json(path.read_text())
@@ -115,50 +115,62 @@ async def read_company(
     search: SearchResult,
     client: genai.Client,
     semaphore: asyncio.Semaphore,
-    max_retries: int = 3,
 ) -> ReaderResult:
-    """Read and classify a single company with rate limiting and retries."""
+    """Read and classify a single company via url_context."""
     async with semaphore:
         prompt = _build_prompt(search)
+        total_in, total_out = 0, 0
 
-        for attempt in range(max_retries):
+        for attempt in range(2):
             try:
-                response = await client.aio.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=_READER_CONFIG,
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=prompt,
+                        config=_READER_CONFIG,
+                    ),
+                    timeout=120,
                 )
-                result = _parse_reader_response(response, search)
+
+                input_tok, output_tok = extract_token_usage(response)
+                total_in += input_tok
+                total_out += output_tok
+
+                retrieval_status, tool_tokens = _extract_url_metadata(response)
+
+                if tool_tokens < MIN_VIABLE_TOKENS:
+                    if attempt == 0:
+                        print(f"  [retry] {search.company_name}: only {tool_tokens:,} tokens, retrying...")
+                        await asyncio.sleep(backoff(attempt))
+                        continue
+                    print(f"  [fail] {search.company_name}: only {tool_tokens:,} tokens read")
+                    break
+
+                data = ReaderResponse.model_validate_json(response.text or "")
+                result = _build_reader_result(
+                    data, search,
+                    url_retrieval_status=retrieval_status,
+                    document_token_count=tool_tokens,
+                    total_input_tokens=total_in,
+                    total_output_tokens=total_out,
+                )
                 tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
-                tokens = f"{result.document_token_count:,} tokens read"
-                print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) [{tokens}]")
-                if result.url_retrieval_status and "SUCCESS" not in result.url_retrieval_status:
-                    print(f"  [WARN] {search.company_name}: URL retrieval status: {result.url_retrieval_status}")
-                if 0 < result.document_token_count < 5_000:
-                    print(f"  [WARN] {search.company_name}: Very few tokens read ({result.document_token_count}) — may not be the full filing")
-                break
+                print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) "
+                      f"[{tool_tokens:,} tokens via url_context]")
+                _save_result(result)
+                return result
+
             except Exception as e:
                 error_str = str(e)
-                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
-                if is_rate_limit and attempt < max_retries - 1:
-                    wait = 2 ** (attempt + 1) * 10
-                    print(f"  [rate limit] {search.company_name} — retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                if is_retryable(error_str) and attempt == 0:
+                    wait = backoff(attempt)
                     await asyncio.sleep(wait)
                     continue
-                print(f"  [ERROR] {search.company_name}: {error_str}")
-                result = ReaderResult(
-                    company_name=search.company_name,
-                    ticker=search.ticker,
-                    slug=search.slug,
-                    year=search.report_year,
-                    source_url=search.source_url,
-                    source_type=search.source_type,
-                    error=error_str,
-                )
+                print(f"  [error] {search.company_name}: {error_str[:120]}")
                 break
 
-        output_path = _result_path(search.slug)
-        output_path.write_text(result.model_dump_json(indent=2))
+        result = _failed_result(search, total_in, total_out)
+        _save_result(result)
         return result
 
 
@@ -166,7 +178,6 @@ async def read_companies(
     search_results: list[SearchResult] | None = None,
     skip_existing: bool = True,
 ) -> list[ReaderResult]:
-    """Read and classify all searched companies."""
     if search_results is None:
         search_results = load_search_results()
 

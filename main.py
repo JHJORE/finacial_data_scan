@@ -3,7 +3,9 @@
 Usage:
     uv run python main.py                     # full pipeline, all companies
     uv run python main.py --sample 50         # full pipeline, random sample of 50
+    uv run python main.py --year 2014         # search for 2014 annual reports
     uv run python main.py search              # search only (creates new run)
+    uv run python main.py search --year 2014  # search for 2014 reports
     uv run python main.py read                # read + assemble (reuses latest run)
     uv run python main.py assemble            # assemble matrix from existing results
     uv run python main.py validate            # print random sample for review
@@ -212,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     val_p.add_argument("--n", type=int, default=10, help="Number of results to review")
 
     parser.add_argument("--sample", type=int, default=None, help="Process a random sample of N companies instead of all")
+    parser.add_argument("--year", type=int, default=None, help="Target fiscal year to search for (e.g. 2014). Defaults to current year.")
 
     return parser
 
@@ -219,6 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.year:
+        config.TARGET_YEAR = args.year
+        print(f"Target year: {args.year}")
 
     command = args.command or "run"
 

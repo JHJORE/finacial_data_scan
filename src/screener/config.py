@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 
 from google import genai
+from google.genai.types import HttpOptions
 
 load_dotenv()
 
@@ -19,15 +20,21 @@ SEARCH_DIR: Path = RUNS_DIR / "_default" / "search"
 RESULTS_DIR: Path = RUNS_DIR / "_default" / "results"
 OUTPUT_DIR: Path = RUNS_DIR / "_default" / "output"
 
-# API
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-VERTEX_API_KEY = os.getenv("VERTEX_API_KEY", "")
+# API - Vertex AI (uses Application Default Credentials)
+GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
 # Model
 GEMINI_MODEL = "gemini-3-flash-preview"
 
+# Search target year — set via .env or CLI --year flag; defaults to current year
+TARGET_YEAR: int = int(os.getenv("TARGET_YEAR", 0)) or datetime.now().year
+
 # Rate limiting
 MAX_CONCURRENT_REQUESTS = 50
+
+# Reader — skip classification if url_context returns too few tokens
+MIN_VIABLE_TOKENS = 10_000
 
 
 def init_run(create_new: bool = True) -> Path:
@@ -70,6 +77,11 @@ def init_run(create_new: bool = True) -> Path:
     return run_dir
 
 
-def create_gemini_client() -> genai.Client:
-    """Create a Gemini API client using the standard (non-Vertex) API."""
-    return genai.Client(api_key=GOOGLE_API_KEY)
+def create_gemini_client(api_version: str = "v1beta1") -> genai.Client:
+    """Create a Gemini API client using Vertex AI."""
+    return genai.Client(
+        vertexai=True,
+        project=GCP_PROJECT,
+        location=GCP_LOCATION,
+        http_options=HttpOptions(api_version=api_version),
+    )
