@@ -59,20 +59,25 @@ def _ticker_to_locale(ticker: str) -> dict[str, str]:
 
 
 _COMBINED_SYSTEM = (
-    "<role>You are a web researcher with google_search and url_context tools.</role>\n"
-    "<rules>\n"
-    "  - You MUST use google_search (up to 3 searches) before responding\n"
-    "  - Include the company ticker symbol in your search queries for better results\n"
-    "  - Then use url_context to READ the most promising result page and find the annual report download link\n"
-    "  - On the page, list ALL document links before selecting the best one\n"
-    "  - Keep search queries simple: no filetype:, inurl:, or other operators\n"
-    "  - After reading a page with url_context, include ALL URLs you found in your response text\n"
-    "  - Even if you couldn't find the annual report, output the company website URL you visited\n"
-    "  - Your response MUST contain at least one URL\n"
-    "  - Return real download URLs, never Google redirect URLs\n"
-    "  - The annual report PDF usually won't appear directly in search results — you typically need to navigate to it through the company's website\n"
-    "  - If a search result IS already a direct PDF link, use it directly without further navigation\n"
-    "</rules>"
+    "<role>You are a web researcher. Your ONLY job is to find a PDF annual report URL.</role>\n"
+    "\n"
+    "<critical_rules>\n"
+    "STEP 1 — SEARCH: Do exactly 1-2 google_search calls. STOP searching after 2 queries.\n"
+    "  - Query 1: \"{company_name} annual report {year}\"\n"
+    "  - Query 2 (if needed): \"{company_name} investor relations\"\n"
+    "  - NEVER use filetype:, inurl:, site:, or any search operators\n"
+    "  - NEVER do more than 2 searches. More searches waste your budget.\n"
+    "\n"
+    "STEP 2 — NAVIGATE: Use url_context to READ the top search result page.\n"
+    "  - The annual report PDF is almost never in search results directly\n"
+    "  - You MUST click through to the company website and find the PDF link\n"
+    "  - On the page, find links to annual reports / financial reports / investor relations\n"
+    "  - Look for PDF download links, especially ones containing the target year\n"
+    "\n"
+    "STEP 3 — OUTPUT: List ALL URLs you found on the page, then state which one is the annual report.\n"
+    "  - Your response MUST contain URLs\n"
+    "  - Never return Google redirect URLs\n"
+    "</critical_rules>"
 )
 
 _COMBINED_CONFIG = types.GenerateContentConfig(
@@ -183,6 +188,20 @@ async def _validate_url(url: str) -> tuple[bool, str]:
             return True, "ok"
     except Exception as e:
         return False, str(e)[:100]
+
+
+async def _get_content_type(url: str) -> str:
+    """Get the content-type of a URL without downloading the full body."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, headers=_BROWSER_HEADERS, timeout=10
+        ) as http:
+            resp = await http.head(url)
+            if resp.status_code == 405:
+                resp = await http.get(url, headers={**_BROWSER_HEADERS, "Range": "bytes=0-1024"})
+            return resp.headers.get("content-type", "").split(";")[0].strip().lower()
+    except Exception:
+        return ""
 
 
 def _build_prompt(company: Company) -> str:
@@ -423,28 +442,39 @@ async def search_company(
                 _save_result(company, result)
                 return result
 
-        # ── Validate URLs from combined call ───────────────────────
-        # Skip direct validation for redirect-resolved URLs (they're landing
-        # pages that need navigation, not direct document links)
+        # ── Validate URLs: only accept PDFs directly ────────────────
+        # HTML pages (homepages, IR pages) must go through navigation to
+        # find the actual annual report PDF link.
+        landing_pages: list[str] = []
         if not urls_from_redirects:
             for url in real_urls:
                 valid, reason = await _validate_url(url)
                 if valid:
-                    result = _make_result(
-                        company, status="found",
-                        report_year=target_year,
-                        source_url=url,
-                        source_type=_classify_source_type(url),
-                        source_rationale="Found via combined google_search + url_context",
-                        url_validated=True,
-                        search_queries_used=search_queries,
-                        total_input_tokens=total_in,
-                        total_output_tokens=total_out,
-                    )
-                    print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
-                    _save_result(company, result)
-                    return result
-                print(f"    [validate] {url[:90]} → {reason}")
+                    content_type = await _get_content_type(url)
+                    if content_type == "application/pdf":
+                        result = _make_result(
+                            company, status="found",
+                            report_year=target_year,
+                            source_url=url,
+                            source_type=_classify_source_type(url),
+                            source_rationale="Found via combined google_search + url_context",
+                            url_validated=True,
+                            search_queries_used=search_queries,
+                            total_input_tokens=total_in,
+                            total_output_tokens=total_out,
+                        )
+                        print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
+                        _save_result(company, result)
+                        return result
+                    else:
+                        # HTML page — save for navigation
+                        landing_pages.append(url)
+                        print(f"    [html page] {url[:90]} → will navigate")
+                else:
+                    print(f"    [validate] {url[:90]} → {reason}")
+            # Use landing pages for navigation if no PDF was found
+            if landing_pages:
+                real_urls = landing_pages
 
         # ── Fallback: navigate landing pages with url_context ────
         locale = _ticker_to_locale(company.ticker)
