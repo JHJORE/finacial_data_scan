@@ -213,7 +213,6 @@ def build_parser() -> argparse.ArgumentParser:
     val_p = sub.add_parser("validate", help="Print random sample for manual review")
     val_p.add_argument("--n", type=int, default=10, help="Number of results to review")
 
-    parser.add_argument("--sample", type=int, default=None, help="Process a random sample of N companies instead of all")
     parser.add_argument("--year", type=int, default=None, help="Target fiscal year to search for (e.g. 2014). Defaults to current year.")
 
     return parser

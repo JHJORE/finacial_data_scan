@@ -25,14 +25,54 @@ _INSTRUCTIONS = (AGENTS_DIR / "search.md").read_text()
 
 _REDIRECT_HOST = "vertexaisearch.cloud.google.com"
 
+# Bloomberg exchange suffix → locale info for search hints
+_LOCALE_MAP: dict[str, dict[str, str]] = {
+    "SS": {"country": "Sweden", "language": "Swedish", "local_term": "årsredovisning"},
+    "NO": {"country": "Norway", "language": "Norwegian", "local_term": "årsrapport"},
+    "DC": {"country": "Denmark", "language": "Danish", "local_term": "årsrapport"},
+    "FH": {"country": "Finland", "language": "Finnish", "local_term": "vuosikertomus"},
+    "GR": {"country": "Germany", "language": "German", "local_term": "Geschäftsbericht"},
+    "SW": {"country": "Switzerland", "language": "German", "local_term": "Geschäftsbericht"},
+    "FP": {"country": "France", "language": "French", "local_term": "rapport annuel"},
+    "NA": {"country": "Netherlands", "language": "Dutch", "local_term": "jaarverslag"},
+    "BB": {"country": "Belgium", "language": "Dutch/French", "local_term": "jaarverslag / rapport annuel"},
+    "IM": {"country": "Italy", "language": "Italian", "local_term": "relazione annuale"},
+    "SM": {"country": "Spain", "language": "Spanish", "local_term": "informe anual"},
+    "PL": {"country": "Poland", "language": "Polish", "local_term": "raport roczny"},
+    "LN": {"country": "United Kingdom", "language": "English", "local_term": "annual report"},
+    "ID": {"country": "Ireland", "language": "English", "local_term": "annual report"},
+    "CN": {"country": "Canada", "language": "English/French", "local_term": "annual report / rapport annuel"},
+    "CT": {"country": "Canada", "language": "English/French", "local_term": "annual report / rapport annuel"},
+    "AT": {"country": "Australia", "language": "English", "local_term": "annual report"},
+    "US": {"country": "United States", "language": "English", "local_term": "annual report"},
+}
+
+
+def _ticker_to_locale(ticker: str) -> dict[str, str]:
+    """Extract locale info from Bloomberg ticker exchange suffix."""
+    parts = ticker.strip().split()
+    if len(parts) >= 2:
+        exchange = parts[-2].upper() if parts[-1].upper() == "EQUITY" else parts[-1].upper()
+        if exchange in _LOCALE_MAP:
+            return _LOCALE_MAP[exchange]
+    return {"country": "Unknown", "language": "English", "local_term": "annual report"}
+
+
+_COMBINED_SYSTEM = (
+    "<role>You are a web researcher with google_search and url_context tools.</role>\n"
+    "<rules>\n"
+    "  - Use google_search to find the company's investor relations or annual report page (1-2 searches max)\n"
+    "  - Then use url_context to READ that page and find the annual report download link\n"
+    "  - On the page, list ALL document links before selecting the best one\n"
+    "  - Keep search queries simple: no filetype:, inurl:, or other operators\n"
+    "  - Return the real download URL, never a Google redirect URL\n"
+    "  - The annual report PDF usually won't appear directly in search results — you typically need to navigate to it through the company's website\n"
+    "  - If a search result IS already a direct PDF link, use it directly without further navigation\n"
+    "</rules>"
+)
+
 _COMBINED_CONFIG = types.GenerateContentConfig(
-    system_instruction=(
-        "You have google_search and url_context tools. "
-        "After searching, you MUST use url_context to read the most relevant result page "
-        "and find the direct PDF download link on that page. "
-        "Keep queries simple — no filetype:, inurl:, or other operators. Maximum 3 searches. "
-        "Return the real page URL, never a Google redirect URL."
-    ),
+    system_instruction=_COMBINED_SYSTEM,
     tools=[
         types.Tool(google_search=types.GoogleSearch()),
         types.Tool(url_context=types.UrlContext()),
@@ -143,11 +183,18 @@ async def _validate_url(url: str) -> tuple[bool, str]:
 
 def _build_prompt(company: Company) -> str:
     target_year = config.TARGET_YEAR
+    locale = _ticker_to_locale(company.ticker)
+    # Extract short ticker (e.g., "CSU" from "CSU CN Equity")
+    ticker_short = company.ticker.split()[0] if company.ticker else company.ticker
+    locale_hint = f"{locale['country']} ({locale['language']})"
     return _INSTRUCTIONS.format(
         company_name=company.name,
         ticker=company.ticker,
+        ticker_short=ticker_short,
         target_year=target_year,
         fallback_year=target_year - 1,
+        locale_hint=locale_hint,
+        local_term=locale["local_term"],
     )
 
 
@@ -179,6 +226,24 @@ def _extract_real_urls(text: str) -> list[str]:
     raw = _URL_RE.findall(text)
     cleaned = [_clean_url(u) for u in raw]
     return list(dict.fromkeys(u for u in cleaned if not _is_redirect_url(u)))
+
+
+def _extract_grounding_urls(response) -> list[str]:
+    """Extract URLs from grounding metadata (actual search result URLs)."""
+    metadata = _get_grounding_metadata(response)
+    if not metadata:
+        return []
+    chunks = getattr(metadata, "grounding_chunks", None)
+    if not chunks:
+        return []
+    urls = []
+    for chunk in chunks:
+        web = getattr(chunk, "web", None)
+        if web:
+            uri = getattr(web, "uri", None)
+            if uri and not _is_redirect_url(uri):
+                urls.append(_clean_url(uri))
+    return list(dict.fromkeys(urls))
 
 
 def _classify_source_type(url: str) -> str:
@@ -250,8 +315,14 @@ async def search_company(
 
                 url_ctx = _was_url_context_used(resp)
                 real_urls = _extract_real_urls(resp.text or "")
+                # Also pull URLs from grounding metadata (actual search results)
+                grounding_urls = _extract_grounding_urls(resp)
+                # Merge: response URLs first (model's picks), then grounding URLs
+                all_urls = list(dict.fromkeys(real_urls + grounding_urls))
+                real_urls = all_urls
 
                 print(f"    [{company.name}] {len(real_urls)} real URLs"
+                      f" ({len(grounding_urls)} from grounding)"
                       f"{', url_context used' if url_ctx else ''}")
                 break
             except Exception as e:
@@ -302,25 +373,42 @@ async def search_company(
                 return result
             print(f"    [validate] {url[:90]} → {reason}")
 
-        # ── Fallback: read landing pages with explicit url_context ─
+        # ── Fallback: navigate landing pages with url_context ────
+        locale = _ticker_to_locale(company.ticker)
         print(f"    [{company.name}] combined call URLs failed validation, "
-              f"trying url_context fallback on {len(real_urls)} URLs")
+              f"navigating {min(len(real_urls), 2)} landing pages")
         first_valid_page = None
 
-        for page_url in real_urls[:3]:
-            read_prompt = (
-                f"Read this page: {page_url}\n\n"
-                f"Find the direct download link (preferably PDF) for the "
-                f"{company.name} annual report for fiscal year {target_year}.\n"
-                f"If the {target_year} report is not on this page, try {target_year - 1}.\n\n"
-                f"Return ONLY the URL, nothing else."
+        for page_url in real_urls[:2]:
+            # Step 1: Enumerate all document links on the page
+            enumerate_prompt = (
+                f"<role>You are reading a company's web page to find an annual report download link.</role>\n"
+                f"<context>\n"
+                f"  <page_url>{page_url}</page_url>\n"
+                f"  <company>{company.name}</company>\n"
+                f"  <target_year>{target_year}</target_year>\n"
+                f"  <fallback_year>{target_year - 1}</fallback_year>\n"
+                f"</context>\n"
+                f"<task>\n"
+                f"  1. Read this page carefully\n"
+                f"  2. List ALL downloadable document links you find (PDFs, download buttons, document archive links)\n"
+                f"  3. For each link, state: the URL, the document title/label, and the year if visible\n"
+                f"  4. Then identify which link is the annual report for fiscal year {target_year} (or {target_year - 1})\n"
+                f"  5. Return ONLY that URL as the last line of your response\n"
+                f"</task>\n"
+                f"<hints>\n"
+                f"  - Annual reports may be labeled: \"{locale['local_term']}\"\n"
+                f"  - Look for PDF icons, download sections, document libraries\n"
+                f"  - The link might be in a table, list, or card layout\n"
+                f"  - If this is a navigation page, look for a link to the reports/documents section\n"
+                f"</hints>"
             )
 
             try:
                 read_resp = await asyncio.wait_for(
                     client.aio.models.generate_content(
                         model=GEMINI_MODEL,
-                        contents=read_prompt,
+                        contents=enumerate_prompt,
                         config=_URL_READ_CONFIG,
                     ),
                     timeout=120,
@@ -340,7 +428,7 @@ async def search_company(
                             report_year=target_year,
                             source_url=pdf_url,
                             source_type=_classify_source_type(pdf_url),
-                            source_rationale="Found via url_context page read (fallback)",
+                            source_rationale="Found via url_context page navigation (fallback)",
                             url_validated=True,
                             search_queries_used=search_queries,
                             total_input_tokens=total_in,
@@ -356,9 +444,9 @@ async def search_company(
                     if page_valid:
                         first_valid_page = page_url
 
-                print(f"    [read] {page_url[:60]}: no valid PDF link extracted")
+                print(f"    [navigate] {page_url[:60]}: no valid PDF link found")
             except Exception as e:
-                print(f"    [read error] {page_url[:60]}: {str(e)[:80]}")
+                print(f"    [navigate error] {page_url[:60]}: {str(e)[:80]}")
                 continue
 
         # ── Last resort: return landing page for reader to try ─────

@@ -11,7 +11,11 @@ from google import genai
 from google.genai import types
 
 from . import config
-from .config import AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS, MIN_VIABLE_TOKENS, create_gemini_client
+from .config import (
+    AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS,
+    MIN_VIABLE_TOKENS, SEC_MAX_RETRIES, SEC_MIN_VIABLE_TOKENS,
+    create_gemini_client,
+)
 from .models import ReaderResponse, ReaderResult, SearchResult
 from .utils import backoff, extract_token_usage, is_retryable
 
@@ -121,7 +125,12 @@ async def read_company(
         prompt = _build_prompt(search)
         total_in, total_out = 0, 0
 
-        for attempt in range(2):
+        # SEC filings get more retries and a lower token threshold
+        is_sec = search.source_type == "sec_edgar"
+        max_retries = SEC_MAX_RETRIES if is_sec else 2
+        min_tokens = SEC_MIN_VIABLE_TOKENS if is_sec else MIN_VIABLE_TOKENS
+
+        for attempt in range(max_retries):
             try:
                 response = await asyncio.wait_for(
                     client.aio.models.generate_content(
@@ -138,12 +147,16 @@ async def read_company(
 
                 retrieval_status, tool_tokens = _extract_url_metadata(response)
 
-                if tool_tokens < MIN_VIABLE_TOKENS:
-                    if attempt == 0:
-                        print(f"  [retry] {search.company_name}: only {tool_tokens:,} tokens, retrying...")
-                        await asyncio.sleep(backoff(attempt))
+                if tool_tokens < min_tokens:
+                    if attempt < max_retries - 1:
+                        wait = backoff(attempt)
+                        print(f"  [retry] {search.company_name}: only {tool_tokens:,} tokens "
+                              f"(need {min_tokens:,}), status={retrieval_status}, "
+                              f"attempt {attempt + 1}/{max_retries}, waiting {wait:.0f}s...")
+                        await asyncio.sleep(wait)
                         continue
-                    print(f"  [fail] {search.company_name}: only {tool_tokens:,} tokens read")
+                    print(f"  [fail] {search.company_name}: only {tool_tokens:,} tokens read "
+                          f"after {max_retries} attempts (status={retrieval_status})")
                     break
 
                 data = ReaderResponse.model_validate_json(response.text or "")
@@ -162,7 +175,7 @@ async def read_company(
 
             except Exception as e:
                 error_str = str(e)
-                if is_retryable(error_str) and attempt == 0:
+                if is_retryable(error_str) and attempt < max_retries - 1:
                     wait = backoff(attempt)
                     await asyncio.sleep(wait)
                     continue
