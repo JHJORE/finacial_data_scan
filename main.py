@@ -203,8 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    run_p = sub.add_parser("run", help="Full pipeline: search → read → assemble (default)")
-    run_p.add_argument("--sample", type=int, default=None, help="Process a random sample of N companies instead of all")
+    sub.add_parser("run", help="Full pipeline: search → read → assemble (default)")
 
     sub.add_parser("search", help="Search for annual reports only (creates new run)")
     sub.add_parser("read", help="Read + classify + assemble (continues latest run)")
@@ -213,6 +212,8 @@ def build_parser() -> argparse.ArgumentParser:
     val_p = sub.add_parser("validate", help="Print random sample for manual review")
     val_p.add_argument("--n", type=int, default=10, help="Number of results to review")
 
+    # --sample is on the global parser (not just run subparser) so it works
+    # when invoked without a subcommand: `python main.py --sample 5`
     parser.add_argument("--sample", type=int, default=None, help="Process a random sample of N companies instead of all")
     parser.add_argument("--year", type=int, default=None, help="Target fiscal year to search for (e.g. 2014). Defaults to current year.")
 

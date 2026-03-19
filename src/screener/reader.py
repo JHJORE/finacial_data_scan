@@ -174,9 +174,15 @@ async def read_company(
                 return result
 
             except Exception as e:
-                error_str = str(e)
+                error_str = str(e) or type(e).__name__
                 if is_retryable(error_str) and attempt < max_retries - 1:
-                    wait = backoff(attempt)
+                    # Use longer backoff for rate limit errors
+                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                        wait = backoff(attempt) * 3  # ~30s, ~60s, ~120s
+                    else:
+                        wait = backoff(attempt)
+                    print(f"  [retry] {search.company_name}: {error_str[:80]}, "
+                          f"attempt {attempt + 1}/{max_retries}, waiting {wait:.0f}s...")
                     await asyncio.sleep(wait)
                     continue
                 print(f"  [error] {search.company_name}: {error_str[:120]}")
