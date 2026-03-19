@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 
 from . import config
-from .config import AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS, create_gemini_client
+from .config import AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS, THINKING_LEVEL, create_gemini_client
 from .models import Company, SearchResult
 from .utils import backoff, extract_token_usage, is_retryable
 
@@ -80,8 +80,11 @@ _COMBINED_SYSTEM = (
     "</critical_rules>"
 )
 
+_THINKING = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
+
 _COMBINED_CONFIG = types.GenerateContentConfig(
     system_instruction=_COMBINED_SYSTEM,
+    thinking_config=_THINKING,
     tools=[
         types.Tool(google_search=types.GoogleSearch()),
         types.Tool(url_context=types.UrlContext()),
@@ -89,6 +92,7 @@ _COMBINED_CONFIG = types.GenerateContentConfig(
 )
 
 _URL_READ_CONFIG = types.GenerateContentConfig(
+    thinking_config=_THINKING,
     tools=[types.Tool(url_context=types.UrlContext())],
 )
 
@@ -404,6 +408,21 @@ async def search_company(
                 print(f"    [{company.name}] {len(real_urls)} real URLs"
                       f" ({len(grounding_urls)} direct + {num_redirects} redirect from grounding)"
                       f"{', url_context used' if url_ctx else ''}")
+
+                # Debug: save full response for inspection
+                try:
+                    debug_path = config.DEBUG_DIR / f"{company.slug}_search.txt"
+                    debug_info = (
+                        f"=== Combined call response for {company.name} ===\n\n"
+                        f"Response text:\n{resp.text}\n\n"
+                        f"Search queries: {search_queries}\n\n"
+                        f"Real URLs from text: {_extract_real_urls(resp.text or '')}\n\n"
+                        f"Grounding redirect URLs: {all_grounding}\n\n"
+                        f"url_context used: {url_ctx}\n"
+                    )
+                    debug_path.write_text(debug_info)
+                except Exception:
+                    pass
                 break
             except Exception as e:
                 error_str = str(e)
@@ -522,6 +541,18 @@ async def search_company(
 
                 pdf_urls = _extract_real_urls(read_resp.text or "")
                 pdf_urls = [u for u in pdf_urls if u != page_url]
+
+                # Debug: log navigation response
+                try:
+                    nav_idx = real_urls.index(page_url) if page_url in real_urls else 0
+                    debug_path = config.DEBUG_DIR / f"{company.slug}_nav_{nav_idx}.txt"
+                    debug_path.write_text(
+                        f"Page: {page_url}\n\n"
+                        f"Response:\n{read_resp.text}\n\n"
+                        f"Extracted URLs: {pdf_urls}\n"
+                    )
+                except Exception:
+                    pass
 
                 for pdf_url in pdf_urls:
                     pdf_valid, pdf_reason = await _validate_url(pdf_url)
