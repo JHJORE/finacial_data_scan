@@ -198,8 +198,10 @@ def print_summary(df: pd.DataFrame) -> None:
         print(f"  Total input:  {total_in:>12,}")
         print(f"  Total output: {total_out:>12,}")
 
-    errors = df["error"].astype(bool).sum()
-    if errors:
-        print(f"\nErrors: {errors}")
+    error_rows = df[df["error"].astype(bool)]
+    if len(error_rows) > 0:
+        print(f"\nErrors: {len(error_rows)}")
+        for _, row in error_rows.iterrows():
+            print(f"  - {row['acquirer']}: {str(row['error'])[:100]}")
 
     print(f"{'='*60}")
