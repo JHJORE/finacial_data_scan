@@ -40,7 +40,7 @@ _SEC_READER_CONFIG = types.GenerateContentConfig(
     response_json_schema=ReaderResponse.model_json_schema(),
 )
 
-_SEC_HEADERS = {"User-Agent": "FinancialDataScan/1.0 (research tool)", "Accept": "text/html"}
+_SEC_HEADERS = {"User-Agent": "FinancialDataScan/1.0 research@financialdatascan.com", "Accept": "text/html"}
 
 
 async def _download_sec_filing(url: str) -> str:

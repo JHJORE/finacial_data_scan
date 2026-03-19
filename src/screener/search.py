@@ -2,9 +2,9 @@
 
 For US companies: SEC EDGAR EFTS API (no AI needed).
 For non-US companies:
-  1. Combined google_search + url_context (model searches AND reads pages)
-  2. Fallback: explicit url_context read on landing pages if combined call
-     didn't produce a valid URL.
+  1. Search-only call (google_search) to find relevant pages
+  2. Resolve grounding redirect URLs to get real destination URLs
+  3. Navigate landing pages with url_context to find PDF links
 """
 
 import asyncio
@@ -58,37 +58,11 @@ def _ticker_to_locale(ticker: str) -> dict[str, str]:
     return {"country": "Unknown", "language": "English", "local_term": "annual report"}
 
 
-_COMBINED_SYSTEM = (
-    "<role>You are a web researcher. Your ONLY job is to find a PDF annual report URL.</role>\n"
-    "\n"
-    "<critical_rules>\n"
-    "STEP 1 — SEARCH: Do exactly 1-2 google_search calls. STOP searching after 2 queries.\n"
-    "  - Query 1: \"{company_name} annual report {year}\"\n"
-    "  - Query 2 (if needed): \"{company_name} investor relations\"\n"
-    "  - NEVER use filetype:, inurl:, site:, or any search operators\n"
-    "  - NEVER do more than 2 searches. More searches waste your budget.\n"
-    "\n"
-    "STEP 2 — NAVIGATE: Use url_context to READ the top search result page.\n"
-    "  - The annual report PDF is almost never in search results directly\n"
-    "  - You MUST click through to the company website and find the PDF link\n"
-    "  - On the page, find links to annual reports / financial reports / investor relations\n"
-    "  - Look for PDF download links, especially ones containing the target year\n"
-    "\n"
-    "STEP 3 — OUTPUT: List ALL URLs you found on the page, then state which one is the annual report.\n"
-    "  - Your response MUST contain URLs\n"
-    "  - Never return Google redirect URLs\n"
-    "</critical_rules>"
-)
-
 _THINKING = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
 
-_COMBINED_CONFIG = types.GenerateContentConfig(
-    system_instruction=_COMBINED_SYSTEM,
+_SEARCH_ONLY_CONFIG = types.GenerateContentConfig(
     thinking_config=_THINKING,
-    tools=[
-        types.Tool(google_search=types.GoogleSearch()),
-        types.Tool(url_context=types.UrlContext()),
-    ],
+    tools=[types.Tool(google_search=types.GoogleSearch())],
 )
 
 _URL_READ_CONFIG = types.GenerateContentConfig(
@@ -98,7 +72,7 @@ _URL_READ_CONFIG = types.GenerateContentConfig(
 
 _URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 
-_SEC_HEADERS = {"User-Agent": "FinancialDataScan/1.0 (research tool)", "Accept": "application/json"}
+_SEC_HEADERS = {"User-Agent": "FinancialDataScan/1.0 research@financialdatascan.com", "Accept": "application/json"}
 _BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
@@ -106,7 +80,7 @@ _BROWSER_HEADERS = {
 
 _MIN_PDF_SIZE = 10_000
 _VALID_CONTENT_TYPES = {"application/pdf", "text/html"}
-_URL_JUNK_TAIL = re.compile(r'[*\s]+$')
+_URL_JUNK_TAIL = re.compile(r'[`*\s]+$')
 
 
 def _is_redirect_url(url: str) -> bool:
@@ -175,7 +149,7 @@ async def _validate_url(url: str) -> tuple[bool, str]:
             follow_redirects=True, headers=_BROWSER_HEADERS, timeout=15
         ) as http:
             resp = await http.head(url)
-            if resp.status_code == 405:
+            if resp.status_code in (403, 405):
                 resp = await http.get(url, headers={**_BROWSER_HEADERS, "Range": "bytes=0-1024"})
             if resp.status_code not in (200, 206):
                 return False, f"HTTP {resp.status_code}"
@@ -201,7 +175,7 @@ async def _get_content_type(url: str) -> str:
             follow_redirects=True, headers=_BROWSER_HEADERS, timeout=10
         ) as http:
             resp = await http.head(url)
-            if resp.status_code == 405:
+            if resp.status_code in (403, 405):
                 resp = await http.get(url, headers={**_BROWSER_HEADERS, "Range": "bytes=0-1024"})
             return resp.headers.get("content-type", "").split(";")[0].strip().lower()
     except Exception:
@@ -238,39 +212,11 @@ def _extract_search_queries(response) -> list[str]:
     return []
 
 
-def _was_url_context_used(response) -> bool:
-    """Check url_context_metadata to see if the model actually read any pages."""
-    if not hasattr(response, "candidates") or not response.candidates:
-        return False
-    url_meta = getattr(response.candidates[0], "url_context_metadata", None)
-    if url_meta and hasattr(url_meta, "url_metadata") and url_meta.url_metadata:
-        return True
-    return False
-
-
 def _extract_real_urls(text: str) -> list[str]:
     """Extract URLs from text, filtering out Google redirect URLs."""
     raw = _URL_RE.findall(text)
     cleaned = [_clean_url(u) for u in raw]
     return list(dict.fromkeys(u for u in cleaned if not _is_redirect_url(u)))
-
-
-def _extract_grounding_urls(response) -> list[str]:
-    """Extract URLs from grounding metadata (actual search result URLs)."""
-    metadata = _get_grounding_metadata(response)
-    if not metadata:
-        return []
-    chunks = getattr(metadata, "grounding_chunks", None)
-    if not chunks:
-        return []
-    urls = []
-    for chunk in chunks:
-        web = getattr(chunk, "web", None)
-        if web:
-            uri = getattr(web, "uri", None)
-            if uri and not _is_redirect_url(uri):
-                urls.append(_clean_url(uri))
-    return list(dict.fromkeys(urls))
 
 
 def _extract_grounding_redirect_urls(response) -> list[str]:
@@ -318,8 +264,8 @@ async def _resolve_grounding_redirects(response) -> list[str]:
     if not redirect_urls:
         return []
 
-    # Resolve up to 5 redirect URLs in parallel
-    tasks = [_resolve_redirect(u) for u in redirect_urls[:5]]
+    # Resolve up to 10 redirect URLs in parallel
+    tasks = [_resolve_redirect(u) for u in redirect_urls[:10]]
     results = await asyncio.gather(*tasks)
     resolved = [u for u in results if u is not None]
     return list(dict.fromkeys(resolved))
@@ -351,7 +297,7 @@ async def search_company(
 ) -> SearchResult:
     """Search for a single company's annual report.
 
-    SEC EDGAR for US companies, combined google_search + url_context for others.
+    SEC EDGAR for US companies, search → navigate for others.
     """
     async with semaphore:
         total_in, total_out = 0, 0
@@ -372,7 +318,7 @@ async def search_company(
             _save_result(company, result)
             return result
 
-        # ── Combined google_search + url_context ───────────────────
+        # ── Search-only call (google_search, no url_context) ──────
         prompt = _build_prompt(company)
         search_queries: list[str] = []
         real_urls: list[str] = []
@@ -383,49 +329,48 @@ async def search_company(
                     client.aio.models.generate_content(
                         model=GEMINI_MODEL,
                         contents=prompt,
-                        config=_COMBINED_CONFIG,
+                        config=_SEARCH_ONLY_CONFIG,
                     ),
-                    timeout=120,
+                    timeout=60,
                 )
                 in_tok, out_tok = extract_token_usage(resp)
                 total_in += in_tok
                 total_out += out_tok
                 search_queries = _extract_search_queries(resp)
 
-                url_ctx = _was_url_context_used(resp)
-                real_urls = _extract_real_urls(resp.text or "")
-                # Also pull URLs from grounding metadata (actual search results)
-                grounding_urls = _extract_grounding_urls(resp)
-                # Count redirect URLs in grounding (before filtering)
+                # URLs come from grounding metadata (redirect URLs we must resolve)
                 all_grounding = _extract_grounding_redirect_urls(resp)
-                num_redirects = len([u for u in all_grounding if _is_redirect_url(u)])
-                # Merge: response URLs first (model's picks), then grounding URLs
-                all_urls = list(dict.fromkeys(real_urls + grounding_urls))
-                real_urls = all_urls
+                # Also check response text for any real URLs the model mentioned
+                text_urls = _extract_real_urls(resp.text or "")
 
                 if search_queries:
                     print(f"    [{company.name}] queries: {search_queries}")
-                print(f"    [{company.name}] {len(real_urls)} real URLs"
-                      f" ({len(grounding_urls)} direct + {num_redirects} redirect from grounding)"
-                      f"{', url_context used' if url_ctx else ''}")
 
-                # Debug: save full response for inspection
+                # Debug: save full search response
                 try:
                     debug_path = config.DEBUG_DIR / f"{company.slug}_search.txt"
                     debug_info = (
-                        f"=== Combined call response for {company.name} ===\n\n"
+                        f"=== Search-only response for {company.name} ===\n\n"
                         f"Response text:\n{resp.text}\n\n"
                         f"Search queries: {search_queries}\n\n"
-                        f"Real URLs from text: {_extract_real_urls(resp.text or '')}\n\n"
-                        f"Grounding redirect URLs: {all_grounding}\n\n"
-                        f"url_context used: {url_ctx}\n"
+                        f"URLs from text: {text_urls}\n\n"
+                        f"Grounding redirect URLs: {all_grounding}\n"
                     )
                     debug_path.write_text(debug_info)
                 except Exception:
                     pass
+
+                # Resolve grounding redirect URLs to real destinations
+                resolved_urls = await _resolve_grounding_redirects(resp)
+                # Merge: text URLs first, then resolved grounding URLs
+                real_urls = list(dict.fromkeys(text_urls + resolved_urls))
+
+                print(f"    [{company.name}] {len(real_urls)} real URLs"
+                      f" ({len(text_urls)} from text + {len(resolved_urls)} resolved"
+                      f" from {len(all_grounding)} grounding)")
                 break
             except Exception as e:
-                error_str = str(e)
+                error_str = str(e) or type(e).__name__
                 if is_retryable(error_str) and attempt == 0:
                     wait = backoff(attempt)
                     print(f"  [retry] {company.name}: {error_str[:80]}")
@@ -441,67 +386,56 @@ async def search_company(
                 _save_result(company, result)
                 return result
 
-        urls_from_redirects = False
         if not real_urls:
-            # Try resolving grounding redirect URLs to get real search result URLs
-            resolved_urls = await _resolve_grounding_redirects(resp)
-            if resolved_urls:
-                print(f"    [{company.name}] resolved {len(resolved_urls)} grounding redirect URLs: "
-                      f"{', '.join(u[:60] for u in resolved_urls[:3])}")
-                real_urls = resolved_urls
-                urls_from_redirects = True
-            else:
-                result = _make_result(
-                    company,
-                    search_queries_used=search_queries,
-                    total_input_tokens=total_in,
-                    total_output_tokens=total_out,
-                )
-                print(f"  [not found] {company.name}: no real URLs in search results")
-                _save_result(company, result)
-                return result
+            result = _make_result(
+                company,
+                search_queries_used=search_queries,
+                total_input_tokens=total_in,
+                total_output_tokens=total_out,
+                error="No URLs found from search",
+            )
+            print(f"  [not found] {company.name}: no real URLs in search results")
+            _save_result(company, result)
+            return result
 
-        # ── Validate URLs: only accept PDFs directly ────────────────
-        # HTML pages (homepages, IR pages) must go through navigation to
-        # find the actual annual report PDF link.
+        # ── Check for direct PDF hits, collect HTML pages for navigation ──
         landing_pages: list[str] = []
-        if not urls_from_redirects:
-            for url in real_urls:
-                valid, reason = await _validate_url(url)
-                if valid:
-                    content_type = await _get_content_type(url)
-                    if content_type == "application/pdf":
-                        result = _make_result(
-                            company, status="found",
-                            report_year=target_year,
-                            source_url=url,
-                            source_type=_classify_source_type(url),
-                            source_rationale="Found via combined google_search + url_context",
-                            url_validated=True,
-                            search_queries_used=search_queries,
-                            total_input_tokens=total_in,
-                            total_output_tokens=total_out,
-                        )
-                        print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
-                        _save_result(company, result)
-                        return result
-                    else:
-                        # HTML page — save for navigation
-                        landing_pages.append(url)
-                        print(f"    [html page] {url[:90]} → will navigate")
+        for url in real_urls:
+            valid, reason = await _validate_url(url)
+            if valid:
+                content_type = await _get_content_type(url)
+                if content_type == "application/pdf":
+                    result = _make_result(
+                        company, status="found",
+                        report_year=target_year,
+                        source_url=url,
+                        source_type=_classify_source_type(url),
+                        source_rationale="PDF found directly in search results",
+                        url_validated=True,
+                        search_queries_used=search_queries,
+                        total_input_tokens=total_in,
+                        total_output_tokens=total_out,
+                    )
+                    print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
+                    _save_result(company, result)
+                    return result
                 else:
-                    print(f"    [validate] {url[:90]} → {reason}")
-            # Use landing pages for navigation if no PDF was found
-            if landing_pages:
-                real_urls = landing_pages
+                    landing_pages.append(url)
+                    print(f"    [html page] {url[:90]} → will navigate")
+            else:
+                print(f"    [validate] {url[:90]} → {reason}")
 
-        # ── Fallback: navigate landing pages with url_context ────
+        if not landing_pages:
+            # All URLs failed validation — try navigating them anyway
+            landing_pages = real_urls
+
+        # ── Navigate landing pages with url_context to find PDF links ──
         locale = _ticker_to_locale(company.ticker)
-        nav_count = min(len(real_urls), 5)
+        nav_count = min(len(landing_pages), 5)
         print(f"    [{company.name}] navigating {nav_count} landing pages")
         first_valid_page = None
 
-        for page_url in real_urls[:5]:
+        for page_url in landing_pages[:5]:
             # Step 1: Enumerate all document links on the page
             enumerate_prompt = (
                 f"<role>You are reading a company's web page to find an annual report download link.</role>\n"
@@ -544,7 +478,7 @@ async def search_company(
 
                 # Debug: log navigation response
                 try:
-                    nav_idx = real_urls.index(page_url) if page_url in real_urls else 0
+                    nav_idx = landing_pages.index(page_url) if page_url in landing_pages else 0
                     debug_path = config.DEBUG_DIR / f"{company.slug}_nav_{nav_idx}.txt"
                     debug_path.write_text(
                         f"Page: {page_url}\n\n"
@@ -605,7 +539,7 @@ async def search_company(
             search_queries_used=search_queries,
             total_input_tokens=total_in,
             total_output_tokens=total_out,
-            error=f"No valid URL found ({len(real_urls)} URLs tried)",
+            error=f"No valid URL found ({len(landing_pages)} landing pages navigated)",
         )
         print(f"  [not found] {company.name}: no valid URLs found")
         _save_result(company, result)
