@@ -346,20 +346,6 @@ async def search_company(
                 if search_queries:
                     print(f"    [{company.name}] queries: {search_queries}")
 
-                # Debug: save full search response
-                try:
-                    debug_path = config.DEBUG_DIR / f"{company.slug}_search.txt"
-                    debug_info = (
-                        f"=== Search-only response for {company.name} ===\n\n"
-                        f"Response text:\n{resp.text}\n\n"
-                        f"Search queries: {search_queries}\n\n"
-                        f"URLs from text: {text_urls}\n\n"
-                        f"Grounding redirect URLs: {all_grounding}\n"
-                    )
-                    debug_path.write_text(debug_info)
-                except Exception:
-                    pass
-
                 # Resolve grounding redirect URLs to real destinations
                 resolved_urls = await _resolve_grounding_redirects(resp)
                 # Merge: text URLs first, then resolved grounding URLs
@@ -368,6 +354,9 @@ async def search_company(
                 print(f"    [{company.name}] {len(real_urls)} real URLs"
                       f" ({len(text_urls)} from text + {len(resolved_urls)} resolved"
                       f" from {len(all_grounding)} grounding)")
+                if resolved_urls:
+                    for u in resolved_urls[:3]:
+                        print(f"      → {u[:90]}")
                 break
             except Exception as e:
                 error_str = str(e) or type(e).__name__
@@ -460,8 +449,9 @@ async def search_company(
                 f"</hints>"
             )
 
-            try:
-                read_resp = await asyncio.wait_for(
+            async def _try_navigate():
+                """Navigate a page and return found PDF URL or None."""
+                resp = await asyncio.wait_for(
                     client.aio.models.generate_content(
                         model=GEMINI_MODEL,
                         contents=enumerate_prompt,
@@ -469,43 +459,42 @@ async def search_company(
                     ),
                     timeout=120,
                 )
-                in_tok, out_tok = extract_token_usage(read_resp)
+                nonlocal total_in, total_out
+                in_tok, out_tok = extract_token_usage(resp)
                 total_in += in_tok
                 total_out += out_tok
 
-                pdf_urls = _extract_real_urls(read_resp.text or "")
-                pdf_urls = [u for u in pdf_urls if u != page_url]
+                found_urls = _extract_real_urls(resp.text or "")
+                found_urls = [u for u in found_urls if u != page_url]
+                if found_urls:
+                    print(f"    [navigate] {page_url[:60]}: found {len(found_urls)} URLs")
+                    for u in found_urls[:3]:
+                        print(f"      → {u[:90]}")
 
-                # Debug: log navigation response
-                try:
-                    nav_idx = landing_pages.index(page_url) if page_url in landing_pages else 0
-                    debug_path = config.DEBUG_DIR / f"{company.slug}_nav_{nav_idx}.txt"
-                    debug_path.write_text(
-                        f"Page: {page_url}\n\n"
-                        f"Response:\n{read_resp.text}\n\n"
-                        f"Extracted URLs: {pdf_urls}\n"
-                    )
-                except Exception:
-                    pass
-
-                for pdf_url in pdf_urls:
+                for pdf_url in found_urls:
                     pdf_valid, pdf_reason = await _validate_url(pdf_url)
                     if pdf_valid:
-                        result = _make_result(
-                            company, status="found",
-                            report_year=target_year,
-                            source_url=pdf_url,
-                            source_type=_classify_source_type(pdf_url),
-                            source_rationale="Found via url_context page navigation (fallback)",
-                            url_validated=True,
-                            search_queries_used=search_queries,
-                            total_input_tokens=total_in,
-                            total_output_tokens=total_out,
-                        )
-                        print(f"  [ok] {company.name}: {result.source_type} → {pdf_url[:90]}")
-                        _save_result(company, result)
-                        return result
+                        return pdf_url
                     print(f"    [validate pdf] {pdf_url[:90]} → {pdf_reason}")
+                return None
+
+            try:
+                pdf_url = await _try_navigate()
+                if pdf_url:
+                    result = _make_result(
+                        company, status="found",
+                        report_year=target_year,
+                        source_url=pdf_url,
+                        source_type=_classify_source_type(pdf_url),
+                        source_rationale="Found via url_context page navigation",
+                        url_validated=True,
+                        search_queries_used=search_queries,
+                        total_input_tokens=total_in,
+                        total_output_tokens=total_out,
+                    )
+                    print(f"  [ok] {company.name}: {result.source_type} → {pdf_url[:90]}")
+                    _save_result(company, result)
+                    return result
 
                 if first_valid_page is None:
                     page_valid, _ = await _validate_url(page_url)
@@ -514,7 +503,33 @@ async def search_company(
 
                 print(f"    [navigate] {page_url[:60]}: no valid PDF link found")
             except Exception as e:
-                print(f"    [navigate error] {page_url[:60]}: {str(e)[:80]}")
+                error_str = str(e) or type(e).__name__
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    wait = backoff(0) * 3
+                    print(f"    [navigate rate-limit] {page_url[:60]}: waiting {wait:.0f}s...")
+                    await asyncio.sleep(wait)
+                    try:
+                        pdf_url = await _try_navigate()
+                        if pdf_url:
+                            result = _make_result(
+                                company, status="found",
+                                report_year=target_year,
+                                source_url=pdf_url,
+                                source_type=_classify_source_type(pdf_url),
+                                source_rationale="Found via url_context page navigation (retry)",
+                                url_validated=True,
+                                search_queries_used=search_queries,
+                                total_input_tokens=total_in,
+                                total_output_tokens=total_out,
+                            )
+                            print(f"  [ok] {company.name}: {result.source_type} → {pdf_url[:90]}")
+                            _save_result(company, result)
+                            return result
+                        print(f"    [navigate] {page_url[:60]}: no valid PDF after retry")
+                    except Exception as e2:
+                        print(f"    [navigate error] {page_url[:60]}: retry failed: {str(e2)[:80]}")
+                else:
+                    print(f"    [navigate error] {page_url[:60]}: {error_str[:80]}")
                 continue
 
         # ── Last resort: return landing page for reader to try ─────

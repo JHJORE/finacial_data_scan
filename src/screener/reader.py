@@ -5,6 +5,7 @@ For non-SEC: uses url_context to read the document at the URL found by search.
 """
 
 import asyncio
+import re
 from pathlib import Path
 
 import httpx
@@ -42,13 +43,20 @@ _SEC_READER_CONFIG = types.GenerateContentConfig(
 
 _SEC_HEADERS = {"User-Agent": "FinancialDataScan/1.0 research@financialdatascan.com", "Accept": "text/html"}
 
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+_WHITESPACE_RE = re.compile(r'\s+')
+
 
 async def _download_sec_filing(url: str) -> str:
-    """Download SEC filing HTML content directly."""
+    """Download SEC filing HTML, strip tags, and return plain text."""
     async with httpx.AsyncClient(headers=_SEC_HEADERS, timeout=30, follow_redirects=True) as http:
         resp = await http.get(url)
         resp.raise_for_status()
-        return resp.text
+        raw_chars = len(resp.text)
+        text = _HTML_TAG_RE.sub(' ', resp.text)
+        text = _WHITESPACE_RE.sub(' ', text).strip()
+        print(f"  [sec] stripped HTML: {raw_chars:,} → {len(text):,} chars")
+        return text
 
 
 def _build_prompt(search: SearchResult) -> str:
@@ -163,21 +171,9 @@ async def _read_sec_company(
 
     for attempt in range(SEC_MAX_RETRIES):
         try:
-            # Download the SEC filing HTML
+            # Download the SEC filing HTML (strips tags automatically)
             filing_text = await _download_sec_filing(search.source_url)
             filing_chars = len(filing_text)
-            print(f"  [sec] {search.company_name}: downloaded {filing_chars:,} chars from SEC")
-
-            # Debug: save downloaded content info
-            try:
-                debug_path = config.DEBUG_DIR / f"{search.slug}_sec_download.txt"
-                debug_path.write_text(
-                    f"URL: {search.source_url}\n"
-                    f"Content length: {filing_chars:,} chars\n"
-                    f"First 500 chars:\n{filing_text[:500]}\n"
-                )
-            except Exception:
-                pass
 
             prompt = _build_sec_prompt(search, filing_text)
             response = await asyncio.wait_for(
@@ -248,18 +244,6 @@ async def _read_non_sec_company(
             total_out += output_tok
 
             retrieval_status, tool_tokens = _extract_url_metadata(response)
-
-            # Debug: log reader response
-            try:
-                debug_path = config.DEBUG_DIR / f"{search.slug}_reader.txt"
-                debug_path.write_text(
-                    f"URL: {search.source_url}\n"
-                    f"Retrieval status: {retrieval_status}\n"
-                    f"Tool tokens: {tool_tokens:,}\n"
-                    f"Response:\n{response.text}\n"
-                )
-            except Exception:
-                pass
 
             if tool_tokens < MIN_VIABLE_TOKENS:
                 if attempt < max_retries - 1:
