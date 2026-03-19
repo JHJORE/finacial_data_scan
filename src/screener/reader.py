@@ -1,14 +1,17 @@
 """Agent 2: Reader — Read the annual report and classify as programmatic acquirer.
 
-For SEC filings: downloads HTML directly and passes as text (no url_context).
-For non-SEC: uses url_context to read the document at the URL found by search.
+For SEC filings: downloads HTML directly, strips tags, passes as text.
+For non-SEC PDFs: downloads PDF, extracts text with pdfplumber, passes as text.
+For non-SEC HTML (landing pages): uses url_context to read the page.
 """
 
 import asyncio
+import io
 import re
 from pathlib import Path
 
 import httpx
+import pdfplumber
 from google import genai
 from google.genai import types
 
@@ -25,6 +28,7 @@ _INSTRUCTIONS = (AGENTS_DIR / "reader.md").read_text()
 
 _THINKING = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
 
+# Config with url_context — for HTML landing pages only
 _READER_CONFIG = types.GenerateContentConfig(
     tools=[
         types.Tool(url_context=types.UrlContext()),
@@ -34,18 +38,24 @@ _READER_CONFIG = types.GenerateContentConfig(
     response_json_schema=ReaderResponse.model_json_schema(),
 )
 
-# SEC: no url_context tool — we pass the filing text directly
-_SEC_READER_CONFIG = types.GenerateContentConfig(
+# Config without url_context — for SEC filings and downloaded PDFs
+_DIRECT_READER_CONFIG = types.GenerateContentConfig(
     thinking_config=_THINKING,
     response_mime_type="application/json",
     response_json_schema=ReaderResponse.model_json_schema(),
 )
 
 _SEC_HEADERS = {"User-Agent": "FinancialDataScan/1.0 research@financialdatascan.com", "Accept": "text/html"}
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "application/pdf,*/*;q=0.8",
+}
 
 _HTML_TAG_RE = re.compile(r'<[^>]+>')
 _WHITESPACE_RE = re.compile(r'\s+')
 
+
+# ── Download helpers ─────────────────────────────────────────
 
 async def _download_sec_filing(url: str) -> str:
     """Download SEC filing HTML, strip tags, and return plain text."""
@@ -59,7 +69,47 @@ async def _download_sec_filing(url: str) -> str:
         return text
 
 
+async def _download_pdf(url: str) -> str:
+    """Download PDF and extract text using pdfplumber."""
+    async with httpx.AsyncClient(
+        headers=_BROWSER_HEADERS, timeout=60, follow_redirects=True
+    ) as http:
+        resp = await http.get(url)
+        resp.raise_for_status()
+        pdf_bytes = resp.content
+
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+        num_pages = len(pdf.pages)
+
+    text = "\n".join(text_parts)
+    print(f"  [pdf] extracted {len(text):,} chars from {num_pages} pages")
+    return text
+
+
+async def _is_pdf_url(url: str) -> bool:
+    """Check if a URL points to a PDF by inspecting content-type."""
+    if url.lower().endswith('.pdf'):
+        return True
+    try:
+        async with httpx.AsyncClient(
+            headers=_BROWSER_HEADERS, timeout=10, follow_redirects=True
+        ) as http:
+            resp = await http.head(url)
+            content_type = resp.headers.get("content-type", "").lower()
+            return "application/pdf" in content_type
+    except Exception:
+        return False
+
+
+# ── Prompt builders ──────────────────────────────────────────
+
 def _build_prompt(search: SearchResult) -> str:
+    """Build prompt for url_context-based reading (HTML pages)."""
     return _INSTRUCTIONS.format(
         company_name=search.company_name,
         ticker=search.ticker,
@@ -68,8 +118,8 @@ def _build_prompt(search: SearchResult) -> str:
     )
 
 
-def _build_sec_prompt(search: SearchResult, filing_text: str) -> str:
-    """Build prompt for SEC filings with the filing text embedded directly."""
+def _build_direct_prompt(search: SearchResult, document_text: str, tag: str = "annual_report") -> str:
+    """Build prompt with document text embedded directly (SEC filings and PDFs)."""
     base = _INSTRUCTIONS.format(
         company_name=search.company_name,
         ticker=search.ticker,
@@ -78,13 +128,15 @@ def _build_sec_prompt(search: SearchResult, filing_text: str) -> str:
     )
     return (
         f"{base}\n\n"
-        f"<sec_filing>\n"
-        f"The SEC filing content is provided below. "
+        f"<{tag}>\n"
+        f"The document content is provided below. "
         f"Analyze this text directly — do NOT use url_context.\n\n"
-        f"{filing_text}\n"
-        f"</sec_filing>"
+        f"{document_text}\n"
+        f"</{tag}>"
     )
 
+
+# ── Result helpers ───────────────────────────────────────────
 
 def _extract_url_metadata(response) -> tuple[str, int]:
     retrieval_status = ""
@@ -162,27 +214,29 @@ def load_search_results() -> list[SearchResult]:
     return results
 
 
-async def _read_sec_company(
+# ── Reader functions ─────────────────────────────────────────
+
+async def _read_direct(
     search: SearchResult,
     client: genai.Client,
+    document_text: str,
+    source_label: str,
 ) -> ReaderResult:
-    """Read and classify a SEC company by downloading the filing directly."""
+    """Classify a company using directly-provided document text (SEC or PDF)."""
     total_in, total_out = 0, 0
+    doc_chars = len(document_text)
+    max_retries = SEC_MAX_RETRIES
 
-    for attempt in range(SEC_MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
-            # Download the SEC filing HTML (strips tags automatically)
-            filing_text = await _download_sec_filing(search.source_url)
-            filing_chars = len(filing_text)
-
-            prompt = _build_sec_prompt(search, filing_text)
+            prompt = _build_direct_prompt(search, document_text)
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=prompt,
-                    config=_SEC_READER_CONFIG,
+                    config=_DIRECT_READER_CONFIG,
                 ),
-                timeout=180,  # longer timeout for large filings
+                timeout=180,
             )
 
             input_tok, output_tok = extract_token_usage(response)
@@ -193,22 +247,24 @@ async def _read_sec_company(
             result = _build_reader_result(
                 data, search,
                 url_retrieval_status="DIRECT_DOWNLOAD",
-                document_token_count=filing_chars,  # chars, not tokens, but useful metric
+                document_token_count=doc_chars,
                 total_input_tokens=total_in,
                 total_output_tokens=total_out,
             )
             tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
             print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) "
-                  f"[{filing_chars:,} chars via direct download]")
+                  f"[{doc_chars:,} chars via {source_label}]")
             _save_result(result)
             return result
 
         except Exception as e:
             error_str = str(e) or type(e).__name__
-            if is_retryable(error_str) and attempt < SEC_MAX_RETRIES - 1:
+            if is_retryable(error_str) and attempt < max_retries - 1:
                 wait = backoff(attempt)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    wait *= 3
                 print(f"  [retry] {search.company_name}: {error_str[:80]}, "
-                      f"attempt {attempt + 1}/{SEC_MAX_RETRIES}, waiting {wait:.0f}s...")
+                      f"attempt {attempt + 1}/{max_retries}, waiting {wait:.0f}s...")
                 await asyncio.sleep(wait)
                 continue
             print(f"  [error] {search.company_name}: {error_str[:120]}")
@@ -219,11 +275,11 @@ async def _read_sec_company(
     return result
 
 
-async def _read_non_sec_company(
+async def _read_url_context(
     search: SearchResult,
     client: genai.Client,
 ) -> ReaderResult:
-    """Read and classify a non-SEC company via url_context."""
+    """Read and classify via url_context (for HTML landing pages)."""
     prompt = _build_prompt(search)
     total_in, total_out = 0, 0
     max_retries = 2
@@ -290,6 +346,8 @@ async def _read_non_sec_company(
     return result
 
 
+# ── Public API ───────────────────────────────────────────────
+
 async def read_company(
     search: SearchResult,
     client: genai.Client,
@@ -298,9 +356,32 @@ async def read_company(
     """Read and classify a single company."""
     async with semaphore:
         if search.source_type == "sec_edgar":
-            return await _read_sec_company(search, client)
+            # SEC: download HTML, strip tags, pass text directly
+            try:
+                filing_text = await _download_sec_filing(search.source_url)
+            except Exception as e:
+                print(f"  [error] {search.company_name}: SEC download failed: {e}")
+                result = _failed_result(search, 0, 0)
+                _save_result(result)
+                return result
+            return await _read_direct(search, client, filing_text, "sec_html")
+
+        # Non-SEC: check if the URL is a PDF
+        is_pdf = await _is_pdf_url(search.source_url)
+        if is_pdf:
+            # Download PDF, extract text, pass directly
+            try:
+                pdf_text = await _download_pdf(search.source_url)
+            except Exception as e:
+                print(f"  [error] {search.company_name}: PDF download failed: {e}")
+                # Fall back to url_context
+                print(f"  [fallback] {search.company_name}: trying url_context instead")
+                return await _read_url_context(search, client)
+            return await _read_direct(search, client, pdf_text, "pdf_download")
         else:
-            return await _read_non_sec_company(search, client)
+            # HTML landing page: use url_context
+            print(f"  [url_context] {search.company_name}: reading HTML page at {search.source_url[:80]}")
+            return await _read_url_context(search, client)
 
 
 async def read_companies(
