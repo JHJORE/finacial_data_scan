@@ -7,6 +7,7 @@ navigating investor relations pages.
 <context>
   <company>{company_name}</company>
   <ticker>{ticker}</ticker>
+  <ticker_short>{ticker_short}</ticker_short>
   <target_year>{target_year}</target_year>
   <fallback_year>{fallback_year}</fallback_year>
   <locale>{locale_hint}</locale>
@@ -19,12 +20,12 @@ report for fiscal year {target_year}. If unavailable, try {fallback_year}.
 
 <strategy>
   <step n="1" name="Search">
-    Search for the company's investor relations or annual report page.
-    Use 1-2 simple queries maximum:
+    You MUST use google_search. Try up to 3 queries:
     - "{company_name} annual report {target_year}"
-    - "{company_name} {ticker_short} investor relations"
-    Do NOT do exhaustive searching. 1-2 queries is enough to find the
-    company website.
+    - "{company_name} {ticker_short} annual report {target_year}"
+    - "{company_name} investor relations"
+    Keep queries simple: no filetype:, inurl:, or other operators.
+    Include the ticker symbol "{ticker_short}" for better results.
   </step>
 
   <step n="2" name="Check results">
@@ -66,4 +67,10 @@ report for fiscal year {target_year}. If unavailable, try {fallback_year}.
   - Did you actually read the page to find this link, or are you guessing?
 </self_check>
 
-<output>Return the FULL direct URL to the annual report. Never return a Google redirect URL.</output>
+<output>
+Your response MUST contain at least one URL.
+If you navigated a page and found document links, list ALL of them.
+Return the FULL direct URL to the annual report as the last line.
+Never return a Google redirect URL.
+Even if you couldn't find the annual report, output the company website URL you visited.
+</output>

@@ -61,11 +61,15 @@ def _ticker_to_locale(ticker: str) -> dict[str, str]:
 _COMBINED_SYSTEM = (
     "<role>You are a web researcher with google_search and url_context tools.</role>\n"
     "<rules>\n"
-    "  - Use google_search to find the company's investor relations or annual report page (1-2 searches max)\n"
-    "  - Then use url_context to READ that page and find the annual report download link\n"
+    "  - You MUST use google_search (up to 3 searches) before responding\n"
+    "  - Include the company ticker symbol in your search queries for better results\n"
+    "  - Then use url_context to READ the most promising result page and find the annual report download link\n"
     "  - On the page, list ALL document links before selecting the best one\n"
     "  - Keep search queries simple: no filetype:, inurl:, or other operators\n"
-    "  - Return the real download URL, never a Google redirect URL\n"
+    "  - After reading a page with url_context, include ALL URLs you found in your response text\n"
+    "  - Even if you couldn't find the annual report, output the company website URL you visited\n"
+    "  - Your response MUST contain at least one URL\n"
+    "  - Return real download URLs, never Google redirect URLs\n"
     "  - The annual report PDF usually won't appear directly in search results — you typically need to navigate to it through the company's website\n"
     "  - If a search result IS already a direct PDF link, use it directly without further navigation\n"
     "</rules>"
@@ -246,6 +250,58 @@ def _extract_grounding_urls(response) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+def _extract_grounding_redirect_urls(response) -> list[str]:
+    """Extract ALL grounding chunk URLs including redirect URLs."""
+    metadata = _get_grounding_metadata(response)
+    if not metadata:
+        return []
+    chunks = getattr(metadata, "grounding_chunks", None)
+    if not chunks:
+        return []
+    urls = []
+    for chunk in chunks:
+        web = getattr(chunk, "web", None)
+        if web:
+            uri = getattr(web, "uri", None)
+            if uri:
+                urls.append(uri)
+    return list(dict.fromkeys(urls))
+
+
+async def _resolve_redirect(url: str) -> str | None:
+    """Follow a redirect URL to get the real destination URL."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, headers=_BROWSER_HEADERS, timeout=5
+        ) as http:
+            resp = await http.head(url)
+            final_url = str(resp.url)
+            if final_url != url and not _is_redirect_url(final_url):
+                return _clean_url(final_url)
+    except Exception:
+        pass
+    return None
+
+
+async def _resolve_grounding_redirects(response) -> list[str]:
+    """Resolve grounding redirect URLs to real destination URLs.
+
+    Grounding chunks from google_search always return redirect URLs through
+    vertexaisearch.cloud.google.com. This function follows the redirects
+    to get the actual search result URLs.
+    """
+    redirect_urls = _extract_grounding_redirect_urls(response)
+    redirect_urls = [u for u in redirect_urls if _is_redirect_url(u)]
+    if not redirect_urls:
+        return []
+
+    # Resolve up to 5 redirect URLs in parallel
+    tasks = [_resolve_redirect(u) for u in redirect_urls[:5]]
+    results = await asyncio.gather(*tasks)
+    resolved = [u for u in results if u is not None]
+    return list(dict.fromkeys(resolved))
+
+
 def _classify_source_type(url: str) -> str:
     host = urlparse(url).hostname or ""
     if "sec.gov" in host:
@@ -317,12 +373,17 @@ async def search_company(
                 real_urls = _extract_real_urls(resp.text or "")
                 # Also pull URLs from grounding metadata (actual search results)
                 grounding_urls = _extract_grounding_urls(resp)
+                # Count redirect URLs in grounding (before filtering)
+                all_grounding = _extract_grounding_redirect_urls(resp)
+                num_redirects = len([u for u in all_grounding if _is_redirect_url(u)])
                 # Merge: response URLs first (model's picks), then grounding URLs
                 all_urls = list(dict.fromkeys(real_urls + grounding_urls))
                 real_urls = all_urls
 
+                if search_queries:
+                    print(f"    [{company.name}] queries: {search_queries}")
                 print(f"    [{company.name}] {len(real_urls)} real URLs"
-                      f" ({len(grounding_urls)} from grounding)"
+                      f" ({len(grounding_urls)} direct + {num_redirects} redirect from grounding)"
                       f"{', url_context used' if url_ctx else ''}")
                 break
             except Exception as e:
@@ -342,44 +403,56 @@ async def search_company(
                 _save_result(company, result)
                 return result
 
+        urls_from_redirects = False
         if not real_urls:
-            result = _make_result(
-                company,
-                search_queries_used=search_queries,
-                total_input_tokens=total_in,
-                total_output_tokens=total_out,
-            )
-            print(f"  [not found] {company.name}: no real URLs in search results")
-            _save_result(company, result)
-            return result
-
-        # ── Validate URLs from combined call ───────────────────────
-        for url in real_urls:
-            valid, reason = await _validate_url(url)
-            if valid:
+            # Try resolving grounding redirect URLs to get real search result URLs
+            resolved_urls = await _resolve_grounding_redirects(resp)
+            if resolved_urls:
+                print(f"    [{company.name}] resolved {len(resolved_urls)} grounding redirect URLs: "
+                      f"{', '.join(u[:60] for u in resolved_urls[:3])}")
+                real_urls = resolved_urls
+                urls_from_redirects = True
+            else:
                 result = _make_result(
-                    company, status="found",
-                    report_year=target_year,
-                    source_url=url,
-                    source_type=_classify_source_type(url),
-                    source_rationale="Found via combined google_search + url_context",
-                    url_validated=True,
+                    company,
                     search_queries_used=search_queries,
                     total_input_tokens=total_in,
                     total_output_tokens=total_out,
                 )
-                print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
+                print(f"  [not found] {company.name}: no real URLs in search results")
                 _save_result(company, result)
                 return result
-            print(f"    [validate] {url[:90]} → {reason}")
+
+        # ── Validate URLs from combined call ───────────────────────
+        # Skip direct validation for redirect-resolved URLs (they're landing
+        # pages that need navigation, not direct document links)
+        if not urls_from_redirects:
+            for url in real_urls:
+                valid, reason = await _validate_url(url)
+                if valid:
+                    result = _make_result(
+                        company, status="found",
+                        report_year=target_year,
+                        source_url=url,
+                        source_type=_classify_source_type(url),
+                        source_rationale="Found via combined google_search + url_context",
+                        url_validated=True,
+                        search_queries_used=search_queries,
+                        total_input_tokens=total_in,
+                        total_output_tokens=total_out,
+                    )
+                    print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
+                    _save_result(company, result)
+                    return result
+                print(f"    [validate] {url[:90]} → {reason}")
 
         # ── Fallback: navigate landing pages with url_context ────
         locale = _ticker_to_locale(company.ticker)
-        print(f"    [{company.name}] combined call URLs failed validation, "
-              f"navigating {min(len(real_urls), 2)} landing pages")
+        nav_count = min(len(real_urls), 5)
+        print(f"    [{company.name}] navigating {nav_count} landing pages")
         first_valid_page = None
 
-        for page_url in real_urls[:2]:
+        for page_url in real_urls[:5]:
             # Step 1: Enumerate all document links on the page
             enumerate_prompt = (
                 f"<role>You are reading a company's web page to find an annual report download link.</role>\n"
