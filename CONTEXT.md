@@ -33,7 +33,7 @@ Constellation Software, Lifco, Danaher, Roper Technologies, TransDigm, Addtech, 
 
 ## Architecture
 
-Two-agent pipeline using **Gemini 3 Flash** (`gemini-3-flash-preview`) via Google's `google-genai` SDK (standard Gemini AI Studio API, not Vertex AI):
+Two-agent pipeline using **Gemini 3 Flash** (`gemini-3-flash-preview`) via Google's `google-genai` SDK (Vertex AI with Application Default Credentials):
 
 ```
 [data/companies.xlsx]           (input: acquirer + ticker columns)
@@ -51,14 +51,9 @@ ASSEMBLE
     → data/output/matrix.csv
 ```
 
-### Why the search agent uses two API calls:
+### How the search agent works:
 
-Gemini cannot combine Google Search grounding with structured JSON output in the same request. The search agent works around this with two calls per company:
-
-1. **Grounding call** — uses `google_search` tool, no structured output. Gemini runs real web searches and returns free-text findings.
-2. **Structure call** — uses `response_json_schema`, no grounding. Takes the free-text search results and formats them into the `SearchResponse` JSON schema.
-
-The `source_url` comes from the model's structured output (not from grounding metadata). The search prompt prioritises SEC EDGAR for US-listed companies.
+For US companies, the search agent uses the SEC EDGAR EFTS API directly (no AI needed). For non-US companies, it uses a combined `google_search` + `url_context` call where the model searches the web, reads the best result page, and navigates to find the annual report PDF link. URLs are also extracted from grounding metadata as additional candidates. If the combined call doesn't produce a valid PDF, a fallback step reads the landing pages with a focused link-enumeration prompt.
 
 ### Why two agents:
 1. **Search agent** focuses only on finding the best source — source quality is critical
@@ -77,7 +72,7 @@ Each agent has a dedicated markdown instruction file in `src/screener/agents/`:
 ## Tech Stack
 
 - **Python 3.11+** managed with `uv`
-- **google-genai** — Gemini API client (standard API with Google Search grounding)
+- **google-genai** — Gemini API client (Vertex AI with Google Search grounding)
 - **pydantic** — data models (Company, SearchResponse, SearchResult, ReaderResponse, ReaderResult)
 - **openpyxl** — read company list from Excel
 - **pandas** — assemble output matrix
@@ -91,14 +86,9 @@ Each agent has a dedicated markdown instruction file in `src/screener/agents/`:
 | `src/screener/agents/search.md` | Search agent instructions |
 | `src/screener/agents/reader.md` | Reader agent instructions |
 | `src/screener/companies.py` | Load company list from Excel |
-| `src/screener/search.py` | Agent 1: two-step Google Search grounding → structured output |
+| `src/screener/search.py` | Agent 1: Google Search grounding + url_context navigation |
 | `src/screener/reader.py` | Agent 2: url_context → read source, extract, classify |
 | `src/screener/assemble.py` | Build company × year matrix |
-| `scripts/pilot.py` | Streaming parallel pipeline (search → read per company) |
-| `scripts/run_search.py` | Batch Agent 1 run (search only) |
-| `scripts/run_reader.py` | Batch Agent 2 run + matrix assembly |
-| `scripts/run_assemble.py` | Matrix assembly only (no API calls) |
-| `scripts/validate.py` | Random sample for manual review |
 
 ## Data Flow & Storage
 
@@ -134,28 +124,31 @@ The Bloomberg exchange suffix (CN = Canada, GR = Germany, SS = Stockholm, US = U
 
 - Google Search grounding: **5,000 prompts/month free** (Gemini 3), then $14/1,000 search queries
 - Gemini Flash tokens: $0.25/MTok input, $1.50/MTok output
-- Each company requires **3 API calls**: search grounding + search structuring + reader
-- `MAX_CONCURRENT_REQUESTS = 5` — up to 5 companies processed in parallel
-- Both agents retry up to 3 times with exponential backoff (20s, 40s, 80s) on 429/RESOURCE_EXHAUSTED errors
+- Each company requires **2+ API calls**: search (combined google_search + url_context) + reader (url_context + structured output). Fallback navigation adds 1-2 more calls for non-US companies.
+- `MAX_CONCURRENT_REQUESTS = 50` — up to 50 companies processed in parallel
+- Both agents retry with exponential backoff on transient errors (429, 500, etc.)
 
 ## Running the Pipeline
 
 ```bash
 # 1. Set up
-cp .env.example .env  # add GOOGLE_API_KEY (from aistudio.google.com)
+cp .env.example .env  # set GOOGLE_CLOUD_PROJECT
 
-# 2. Pilot (default 50 companies, or pass a number)
-uv run python scripts/pilot.py       # all 50
-uv run python scripts/pilot.py 5     # just 5
+# 2. Full pipeline
+uv run python main.py                     # all companies
+uv run python main.py --sample 50         # random sample of 50
+uv run python main.py --year 2014         # specific fiscal year
 
-# 3. Full run (two separate scripts, or use pilot.py)
-uv run python scripts/run_search.py     # Agent 1: find sources
-uv run python scripts/run_reader.py     # Agent 2: read + classify + matrix
+# 3. Individual steps
+uv run python main.py search              # Agent 1 only
+uv run python main.py read                # Agent 2 + assemble (reuses latest run)
+uv run python main.py assemble            # re-assemble matrix only
+uv run python main.py validate --n 20     # manual review
 ```
 
 ## Design Decisions
 
-- **Standard Gemini AI Studio API** (not Vertex AI): simpler auth, single API key
+- **Vertex AI** with Application Default Credentials (gcloud ADC)
 - **Two-step search**: grounding and structured output cannot be combined in Gemini, so the search agent makes two calls per company
 - **Two separate agents**: search agent finds sources, reader agent reads and classifies — clear separation of concerns
 - **Agent instructions in markdown**: easier to iterate on prompts than Python string templates

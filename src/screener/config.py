@@ -36,6 +36,11 @@ MAX_CONCURRENT_REQUESTS = 50
 # Reader — skip classification if url_context returns too few tokens
 MIN_VIABLE_TOKENS = 10_000
 
+# SEC-specific: more retries (transient url_context failures) and lower token
+# threshold (10-K filings are structured; even partial reads contain M&A sections)
+SEC_MAX_RETRIES = 3
+SEC_MIN_VIABLE_TOKENS = 5_000
+
 
 def init_run(create_new: bool = True) -> Path:
     """Initialize a run directory with timestamped subfolders.
