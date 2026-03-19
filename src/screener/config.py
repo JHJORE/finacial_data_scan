@@ -19,6 +19,7 @@ AGENTS_DIR = Path(__file__).parent / "agents"
 SEARCH_DIR: Path = RUNS_DIR / "_default" / "search"
 RESULTS_DIR: Path = RUNS_DIR / "_default" / "results"
 OUTPUT_DIR: Path = RUNS_DIR / "_default" / "output"
+DEBUG_DIR: Path = RUNS_DIR / "_default" / "debug"
 
 # API - Vertex AI (uses Application Default Credentials)
 GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
@@ -26,6 +27,7 @@ GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
 # Model
 GEMINI_MODEL = "gemini-3-flash-preview"
+THINKING_LEVEL = "medium"
 
 # Search target year — set via .env or CLI --year flag; defaults to current year
 TARGET_YEAR: int = int(os.getenv("TARGET_YEAR", 0)) or datetime.now().year
@@ -52,7 +54,7 @@ def init_run(create_new: bool = True) -> Path:
     Returns:
         The run directory path.
     """
-    global SEARCH_DIR, RESULTS_DIR, OUTPUT_DIR
+    global SEARCH_DIR, RESULTS_DIR, OUTPUT_DIR, DEBUG_DIR
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -68,10 +70,12 @@ def init_run(create_new: bool = True) -> Path:
     SEARCH_DIR = run_dir / "search"
     RESULTS_DIR = run_dir / "results"
     OUTPUT_DIR = run_dir / "output"
+    DEBUG_DIR = run_dir / "debug"
 
     SEARCH_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
     latest_link = RUNS_DIR / "latest"
     if latest_link.is_symlink() or latest_link.exists():
