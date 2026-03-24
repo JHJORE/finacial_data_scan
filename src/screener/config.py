@@ -43,6 +43,9 @@ MIN_VIABLE_TOKENS = 10_000
 SEC_MAX_RETRIES = 3
 SEC_MIN_VIABLE_TOKENS = 5_000
 
+# SEC document size guard (character count after HTML parsing)
+SEC_MIN_CHARS = 5_000     # below this, download likely failed
+
 
 def init_run(create_new: bool = True) -> Path:
     """Initialize a run directory with timestamped subfolders.
