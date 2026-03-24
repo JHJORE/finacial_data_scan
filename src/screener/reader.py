@@ -1,15 +1,17 @@
 """Agent 2: Reader — Read the annual report and classify as programmatic acquirer.
 
-For SEC filings: downloads HTML directly, strips tags, passes as text.
-For non-SEC PDFs: downloads PDF, extracts text with pdfplumber, passes as text.
-For non-SEC HTML (landing pages): uses url_context to read the page.
+For SEC filings: checks EDGAR index for PDF, falls back to HTML parsed with
+BeautifulSoup. Non-SEC PDFs are sent as native bytes via Part.from_bytes.
+Non-SEC HTML (landing pages) use url_context.
 """
 
 import asyncio
 import io
 import re
 from pathlib import Path
+from urllib.parse import urljoin
 
+from bs4 import BeautifulSoup
 import httpx
 import pdfplumber
 from google import genai
@@ -18,7 +20,8 @@ from google.genai import types
 from . import config
 from .config import (
     AGENTS_DIR, GEMINI_MODEL, MAX_CONCURRENT_REQUESTS,
-    MIN_VIABLE_TOKENS, SEC_MAX_RETRIES, SEC_MIN_VIABLE_TOKENS,
+    MIN_VIABLE_TOKENS, SEC_MAX_RETRIES,
+    SEC_MIN_CHARS, SEC_MIN_VIABLE_TOKENS,
     THINKING_LEVEL, create_gemini_client,
 )
 from .models import ReaderResponse, ReaderResult, SearchResult
@@ -51,32 +54,141 @@ _BROWSER_HEADERS = {
     "Accept": "application/pdf,*/*;q=0.8",
 }
 
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
-_WHITESPACE_RE = re.compile(r'\s+')
+_BLANK_LINE_RE = re.compile(r'\n{3,}')
+
+
+# ── HTML parsing ─────────────────────────────────────────────
+
+def _table_to_text(table_tag) -> str:
+    """Convert an HTML <table> to pipe-separated plain text."""
+    rows = []
+    for tr in table_tag.find_all("tr"):
+        cells = []
+        for td in tr.find_all(["td", "th"]):
+            cell_text = td.get_text(separator=" ", strip=True)
+            if cell_text:
+                cells.append(cell_text)
+        if cells:
+            rows.append(" | ".join(cells))
+    return "\n".join(rows)
+
+
+def _parse_sec_html(raw_html: str) -> str:
+    """Parse SEC filing HTML with BeautifulSoup, preserving table structure.
+
+    Removes script/style/head content (not just tags), converts tables to
+    pipe-separated text, decodes HTML entities, and normalizes whitespace.
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    # Remove non-content elements and their contents
+    for tag in soup.find_all(["script", "style", "head", "meta", "link", "noscript"]):
+        tag.decompose()
+
+    # Convert tables to readable text before extracting all text
+    for table in soup.find_all("table"):
+        table_text = _table_to_text(table)
+        table.replace_with(table_text)
+
+    # Extract text — BeautifulSoup auto-decodes entities
+    text = soup.get_text(separator="\n")
+
+    # Normalize: strip trailing spaces per line, collapse excessive blank lines
+    lines = [line.rstrip() for line in text.splitlines()]
+    text = "\n".join(lines)
+    text = _BLANK_LINE_RE.sub("\n\n", text).strip()
+
+    return text
 
 
 # ── Download helpers ─────────────────────────────────────────
 
-async def _download_sec_filing(url: str) -> str:
-    """Download SEC filing HTML, strip tags, and return plain text."""
+async def _check_edgar_index_for_pdf(filing_url: str) -> str | None:
+    """Check the EDGAR filing index for a PDF version of the document.
+
+    Derives the index URL from the filing URL, fetches the index JSON,
+    and looks for any .pdf file in the listing.
+    """
+    # Derive the directory URL from the filing URL
+    # e.g., https://www.sec.gov/Archives/edgar/data/CIK/ACC/filename.htm
+    #     → https://www.sec.gov/Archives/edgar/data/CIK/ACC/index.json
+    base_url = filing_url.rsplit("/", 1)[0] + "/"
+    index_url = base_url + "index.json"
+
+    try:
+        async with httpx.AsyncClient(headers=_SEC_HEADERS, timeout=15, follow_redirects=True) as http:
+            resp = await http.get(index_url)
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            items = data.get("directory", {}).get("item", [])
+
+            for item in items:
+                name = item.get("name", "")
+                if name.lower().endswith(".pdf"):
+                    return urljoin(base_url, name)
+
+    except Exception:
+        pass
+
+    return None
+
+
+async def _download_sec_filing(url: str) -> tuple[str | bytes, str]:
+    """Download SEC filing, trying PDF first, falling back to HTML parsing.
+
+    Returns:
+        (content, format): content is either PDF bytes or parsed text string,
+        format is either "pdf" or "html".
+    """
+    # Check if a PDF version exists on the EDGAR index
+    pdf_url = await _check_edgar_index_for_pdf(url)
+    if pdf_url:
+        try:
+            async with httpx.AsyncClient(
+                headers=_SEC_HEADERS, timeout=60, follow_redirects=True
+            ) as http:
+                resp = await http.get(pdf_url)
+                resp.raise_for_status()
+                pdf_bytes = resp.content
+                print(f"  [sec] downloaded PDF from EDGAR index: {len(pdf_bytes):,} bytes")
+                return pdf_bytes, "pdf"
+        except Exception as e:
+            print(f"  [sec] PDF download failed ({e}), falling back to HTML")
+
+    # Download and parse HTML
     async with httpx.AsyncClient(headers=_SEC_HEADERS, timeout=30, follow_redirects=True) as http:
         resp = await http.get(url)
         resp.raise_for_status()
         raw_chars = len(resp.text)
-        text = _HTML_TAG_RE.sub(' ', resp.text)
-        text = _WHITESPACE_RE.sub(' ', text).strip()
-        print(f"  [sec] stripped HTML: {raw_chars:,} → {len(text):,} chars")
-        return text
+
+    text = _parse_sec_html(resp.text)
+    print(f"  [sec] parsed HTML: {raw_chars:,} -> {len(text):,} chars")
+
+    if len(text) < SEC_MIN_CHARS:
+        raise ValueError(
+            f"SEC filing text too short ({len(text):,} chars < {SEC_MIN_CHARS:,}), "
+            f"download may have failed"
+        )
+
+    return text, "html"
 
 
-async def _download_pdf(url: str) -> str:
-    """Download PDF and extract text using pdfplumber."""
+async def _download_pdf_bytes(url: str) -> bytes:
+    """Download a PDF and return raw bytes."""
     async with httpx.AsyncClient(
         headers=_BROWSER_HEADERS, timeout=60, follow_redirects=True
     ) as http:
         resp = await http.get(url)
         resp.raise_for_status()
-        pdf_bytes = resp.content
+        print(f"  [pdf] downloaded {len(resp.content):,} bytes")
+        return resp.content
+
+
+async def _download_pdf(url: str) -> str:
+    """Download PDF and extract text using pdfplumber (fallback path)."""
+    pdf_bytes = await _download_pdf_bytes(url)
 
     text_parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -275,6 +387,79 @@ async def _read_direct(
     return result
 
 
+async def _read_pdf_native(
+    search: SearchResult,
+    client: genai.Client,
+    pdf_bytes: bytes,
+) -> ReaderResult:
+    """Classify using Gemini's native PDF understanding via Part.from_bytes."""
+    total_in, total_out = 0, 0
+    max_retries = SEC_MAX_RETRIES
+
+    base_prompt = _INSTRUCTIONS.format(
+        company_name=search.company_name,
+        ticker=search.ticker,
+        source_url=search.source_url,
+        report_year=search.report_year or "unknown",
+    )
+    prompt_text = (
+        f"{base_prompt}\n\n"
+        "The annual report PDF is attached above. "
+        "Analyze the document directly — do NOT use url_context."
+    )
+
+    contents = [
+        types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+        prompt_text,
+    ]
+
+    for attempt in range(max_retries):
+        try:
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=contents,
+                    config=_DIRECT_READER_CONFIG,
+                ),
+                timeout=300,
+            )
+
+            input_tok, output_tok = extract_token_usage(response)
+            total_in += input_tok
+            total_out += output_tok
+
+            data = ReaderResponse.model_validate_json(response.text or "")
+            result = _build_reader_result(
+                data, search,
+                url_retrieval_status="PDF_NATIVE",
+                document_token_count=input_tok,
+                total_input_tokens=total_in,
+                total_output_tokens=total_out,
+            )
+            tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
+            print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) "
+                  f"[{len(pdf_bytes):,} bytes via pdf_native]")
+            _save_result(result)
+            return result
+
+        except Exception as e:
+            error_str = str(e) or type(e).__name__
+            if is_retryable(error_str) and attempt < max_retries - 1:
+                wait = backoff(attempt)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    wait *= 3
+                print(f"  [retry] {search.company_name}: {error_str[:80]}, "
+                      f"attempt {attempt + 1}/{max_retries}, waiting {wait:.0f}s...")
+                await asyncio.sleep(wait)
+                continue
+            print(f"  [error] {search.company_name}: {error_str[:120]}")
+            break
+
+    result = _failed_result(search, total_in, total_out)
+    _save_result(result)
+    return result
+
+
 async def _read_url_context(
     search: SearchResult,
     client: genai.Client,
@@ -356,28 +541,36 @@ async def read_company(
     """Read and classify a single company."""
     async with semaphore:
         if search.source_type == "sec_edgar":
-            # SEC: download HTML, strip tags, pass text directly
+            # SEC: try PDF from EDGAR index, fall back to parsed HTML
             try:
-                filing_text = await _download_sec_filing(search.source_url)
+                content, fmt = await _download_sec_filing(search.source_url)
             except Exception as e:
                 print(f"  [error] {search.company_name}: SEC download failed: {e}")
                 result = _failed_result(search, 0, 0)
                 _save_result(result)
                 return result
-            return await _read_direct(search, client, filing_text, "sec_html")
+
+            if fmt == "pdf":
+                return await _read_pdf_native(search, client, content)
+            return await _read_direct(search, client, content, "sec_html")
 
         # Non-SEC: check if the URL is a PDF
         is_pdf = await _is_pdf_url(search.source_url)
         if is_pdf:
-            # Download PDF, extract text, pass directly
+            # Download PDF bytes and use Gemini native PDF processing
             try:
-                pdf_text = await _download_pdf(search.source_url)
+                pdf_bytes = await _download_pdf_bytes(search.source_url)
+                return await _read_pdf_native(search, client, pdf_bytes)
             except Exception as e:
-                print(f"  [error] {search.company_name}: PDF download failed: {e}")
-                # Fall back to url_context
-                print(f"  [fallback] {search.company_name}: trying url_context instead")
-                return await _read_url_context(search, client)
-            return await _read_direct(search, client, pdf_text, "pdf_download")
+                print(f"  [error] {search.company_name}: PDF native failed: {e}")
+                # Fall back to pdfplumber text extraction
+                try:
+                    pdf_text = await _download_pdf(search.source_url)
+                    return await _read_direct(search, client, pdf_text, "pdf_download")
+                except Exception as e2:
+                    print(f"  [error] {search.company_name}: PDF text extraction failed: {e2}")
+                    print(f"  [fallback] {search.company_name}: trying url_context instead")
+                    return await _read_url_context(search, client)
         else:
             # HTML landing page: use url_context
             print(f"  [url_context] {search.company_name}: reading HTML page at {search.source_url[:80]}")
