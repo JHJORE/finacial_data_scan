@@ -87,11 +87,18 @@ def _is_redirect_url(url: str) -> bool:
     return _REDIRECT_HOST in url
 
 
-# Path segments that indicate a report/IR landing page (acceptable as fallback)
+# Broad IR keywords — used to prevent homepage detection for shallow IR URLs
 _IR_PATH_KEYWORDS = {
     "investor", "investors", "ir", "reports", "financial",
     "documents", "publications", "annual", "download", "downloads",
     "filings", "presentations", "governance",
+}
+
+# Stricter keywords — for last-resort landing page acceptance, require
+# report-specific pages (not just /investor/ which is an IR hub)
+_REPORT_PATH_KEYWORDS = {
+    "reports", "financial", "documents", "publications", "annual",
+    "download", "downloads", "filings", "presentations",
 }
 
 
@@ -106,17 +113,21 @@ def _is_homepage_url(url: str) -> bool:
     # Root domain or empty path
     if not path or path == "":
         return True
-    # Single shallow segment like /about, /contact, /news
+    # Single shallow segment like /about, /contact, /news, or even /investor
     segments = [s for s in path.split("/") if s]
-    if len(segments) <= 1 and not any(kw in path.lower() for kw in _IR_PATH_KEYWORDS):
+    if len(segments) <= 1 and not any(kw in path.lower() for kw in _REPORT_PATH_KEYWORDS):
         return True
     return False
 
 
 def _is_ir_landing_page(url: str) -> bool:
-    """Check if a URL looks like an investor relations / reports page."""
+    """Check if a URL looks like a reports/documents page (not just an IR hub).
+
+    For last-resort fallback, we need pages that actually list report downloads,
+    not generic IR pages like /investor/ that the reader can't classify from.
+    """
     path = urlparse(url).path.lower()
-    return any(kw in path for kw in _IR_PATH_KEYWORDS)
+    return any(kw in path for kw in _REPORT_PATH_KEYWORDS)
 
 
 def _clean_url(url: str) -> str:

@@ -87,7 +87,7 @@ def assemble_matrix() -> pd.DataFrame:
                     + (s.total_input_tokens if s else 0)
                     + (s.total_output_tokens if s else 0)
                 ),
-                "error": r.error if not is_doc_missing else "",
+                "error": (r.error or "") if not is_doc_missing else "",
             }
         )
 
@@ -198,7 +198,7 @@ def print_summary(df: pd.DataFrame) -> None:
         print(f"  Total input:  {total_in:>12,}")
         print(f"  Total output: {total_out:>12,}")
 
-    error_rows = df[df["error"].astype(bool)]
+    error_rows = df[df["error"].fillna("").astype(str).str.len() > 0]
     if len(error_rows) > 0:
         print(f"\nErrors: {len(error_rows)}")
         for _, row in error_rows.iterrows():
