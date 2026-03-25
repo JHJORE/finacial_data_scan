@@ -46,6 +46,22 @@ SEC_MIN_VIABLE_TOKENS = 5_000
 # SEC document size guard (character count after HTML parsing)
 SEC_MIN_CHARS = 5_000     # below this, download likely failed
 
+_LATEST_POINTER = RUNS_DIR / "latest"
+
+
+def _resolve_latest_run_dir() -> Path | None:
+    """Return the run directory referenced by `latest`, if valid."""
+    if not _LATEST_POINTER.exists() and not _LATEST_POINTER.is_symlink():
+        return None
+    if _LATEST_POINTER.is_symlink():
+        resolved = _LATEST_POINTER.resolve()
+        return resolved if resolved.is_dir() else None
+    if _LATEST_POINTER.is_file():
+        name = _LATEST_POINTER.read_text(encoding="utf-8").strip()
+        if name:
+            candidate = RUNS_DIR / name
+            return candidate if candidate.is_dir() else None
+    return None
 
 def init_run(create_new: bool = True) -> Path:
     """Initialize a run directory with timestamped subfolders.
@@ -64,10 +80,8 @@ def init_run(create_new: bool = True) -> Path:
     if create_new:
         run_dir = RUNS_DIR / datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     else:
-        latest = RUNS_DIR / "latest"
-        if latest.exists():
-            run_dir = latest.resolve()
-        else:
+        run_dir = _resolve_latest_run_dir()
+        if run_dir is None:
             run_dir = RUNS_DIR / datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
     SEARCH_DIR = run_dir / "search"
@@ -80,10 +94,9 @@ def init_run(create_new: bool = True) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    latest_link = RUNS_DIR / "latest"
-    if latest_link.is_symlink() or latest_link.exists():
-        latest_link.unlink()
-    latest_link.symlink_to(run_dir.name)
+    if _LATEST_POINTER.is_symlink() or _LATEST_POINTER.exists():
+        _LATEST_POINTER.unlink()
+    _LATEST_POINTER.write_text(f"{run_dir.name}\n", encoding="utf-8")
 
     print(f"Run directory: {run_dir}")
     return run_dir
