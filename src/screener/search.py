@@ -87,6 +87,38 @@ def _is_redirect_url(url: str) -> bool:
     return _REDIRECT_HOST in url
 
 
+# Path segments that indicate a report/IR landing page (acceptable as fallback)
+_IR_PATH_KEYWORDS = {
+    "investor", "investors", "ir", "reports", "financial",
+    "documents", "publications", "annual", "download", "downloads",
+    "filings", "presentations", "governance",
+}
+
+
+def _is_homepage_url(url: str) -> bool:
+    """Check if a URL is a generic homepage (not a specific document/report page).
+
+    Returns True for URLs like https://company.com/ or https://company.com
+    that would lead the reader to classify based on marketing content.
+    """
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    # Root domain or empty path
+    if not path or path == "":
+        return True
+    # Single shallow segment like /about, /contact, /news
+    segments = [s for s in path.split("/") if s]
+    if len(segments) <= 1 and not any(kw in path.lower() for kw in _IR_PATH_KEYWORDS):
+        return True
+    return False
+
+
+def _is_ir_landing_page(url: str) -> bool:
+    """Check if a URL looks like an investor relations / reports page."""
+    path = urlparse(url).path.lower()
+    return any(kw in path for kw in _IR_PATH_KEYWORDS)
+
+
 def _clean_url(url: str) -> str:
     """Strip trailing wildcards, whitespace, and other junk from URLs."""
     return _URL_JUNK_TAIL.sub("", url)
@@ -297,7 +329,7 @@ async def search_company(
 ) -> SearchResult:
     """Search for a single company's annual report.
 
-    SEC EDGAR for US companies, search → navigate for others.
+    SEC EDGAR for US companies, search -> navigate for others.
     """
     async with semaphore:
         total_in, total_out = 0, 0
@@ -314,7 +346,7 @@ async def search_company(
                 source_rationale="Verified via SEC EDGAR EFTS API",
                 url_validated=True,
             )
-            print(f"  [ok] {company.name}: sec_edgar → {sec_url[:90]}")
+            print(f"  [ok] {company.name}: sec_edgar -> {sec_url[:90]}")
             _save_result(company, result)
             return result
 
@@ -344,7 +376,11 @@ async def search_company(
                 text_urls = _extract_real_urls(resp.text or "")
 
                 if search_queries:
-                    print(f"    [{company.name}] queries: {search_queries}")
+                    print(f"    [{company.name}] queries ({len(search_queries)}): {search_queries[:5]}"
+                          f"{'...' if len(search_queries) > 5 else ''}")
+                    if len(search_queries) > 3:
+                        print(f"    [{company.name}] WARNING: model used {len(search_queries)} "
+                              f"search queries (limit is 3)")
 
                 # Resolve grounding redirect URLs to real destinations
                 resolved_urls = await _resolve_grounding_redirects(resp)
@@ -356,7 +392,7 @@ async def search_company(
                       f" from {len(all_grounding)} grounding)")
                 if resolved_urls:
                     for u in resolved_urls[:3]:
-                        print(f"      → {u[:90]}")
+                        print(f"      -> {u[:90]}")
                 break
             except Exception as e:
                 error_str = str(e) or type(e).__name__
@@ -405,14 +441,14 @@ async def search_company(
                         total_input_tokens=total_in,
                         total_output_tokens=total_out,
                     )
-                    print(f"  [ok] {company.name}: {result.source_type} → {url[:90]}")
+                    print(f"  [ok] {company.name}: {result.source_type} -> {url[:90]}")
                     _save_result(company, result)
                     return result
                 else:
                     landing_pages.append(url)
-                    print(f"    [html page] {url[:90]} → will navigate")
+                    print(f"    [html page] {url[:90]} -> will navigate")
             else:
-                print(f"    [validate] {url[:90]} → {reason}")
+                print(f"    [validate] {url[:90]} -> {reason}")
 
         if not landing_pages:
             # All URLs failed validation — try navigating them anyway
@@ -469,13 +505,13 @@ async def search_company(
                 if found_urls:
                     print(f"    [navigate] {page_url[:60]}: found {len(found_urls)} URLs")
                     for u in found_urls[:3]:
-                        print(f"      → {u[:90]}")
+                        print(f"      -> {u[:90]}")
 
                 for pdf_url in found_urls:
                     pdf_valid, pdf_reason = await _validate_url(pdf_url)
                     if pdf_valid:
                         return pdf_url
-                    print(f"    [validate pdf] {pdf_url[:90]} → {pdf_reason}")
+                    print(f"    [validate pdf] {pdf_url[:90]} -> {pdf_reason}")
                 return None
 
             try:
@@ -492,7 +528,7 @@ async def search_company(
                         total_input_tokens=total_in,
                         total_output_tokens=total_out,
                     )
-                    print(f"  [ok] {company.name}: {result.source_type} → {pdf_url[:90]}")
+                    print(f"  [ok] {company.name}: {result.source_type} -> {pdf_url[:90]}")
                     _save_result(company, result)
                     return result
 
@@ -522,7 +558,7 @@ async def search_company(
                                 total_input_tokens=total_in,
                                 total_output_tokens=total_out,
                             )
-                            print(f"  [ok] {company.name}: {result.source_type} → {pdf_url[:90]}")
+                            print(f"  [ok] {company.name}: {result.source_type} -> {pdf_url[:90]}")
                             _save_result(company, result)
                             return result
                         print(f"    [navigate] {page_url[:60]}: no valid PDF after retry")
@@ -532,22 +568,24 @@ async def search_company(
                     print(f"    [navigate error] {page_url[:60]}: {error_str[:80]}")
                 continue
 
-        # ── Last resort: return landing page for reader to try ─────
-        if first_valid_page:
+        # ── Last resort: return landing page only if it's an IR/report page ─────
+        if first_valid_page and not _is_homepage_url(first_valid_page) and _is_ir_landing_page(first_valid_page):
             result = _make_result(
                 company, status="found",
                 report_year=target_year,
                 source_url=first_valid_page,
                 source_type=_classify_source_type(first_valid_page),
-                source_rationale="Landing page (no direct PDF link found)",
+                source_rationale="IR landing page (no direct PDF link found)",
                 url_validated=True,
                 search_queries_used=search_queries,
                 total_input_tokens=total_in,
                 total_output_tokens=total_out,
             )
-            print(f"  [ok] {company.name}: landing page → {first_valid_page[:90]}")
+            print(f"  [ok] {company.name}: IR landing page -> {first_valid_page[:90]}")
             _save_result(company, result)
             return result
+        elif first_valid_page:
+            print(f"    [{company.name}] rejecting non-IR page as result: {first_valid_page[:90]}")
 
         result = _make_result(
             company,

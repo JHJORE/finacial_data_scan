@@ -33,3 +33,6 @@ markers = [
 
 [project.scripts]
 screener = "main:main"
+
+[tool.uv]
+package = false

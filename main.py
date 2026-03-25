@@ -56,7 +56,7 @@ async def cmd_run(args):
     client = create_gemini_client()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-    print(f"\nProcessing {len(companies)} companies (search → read)...\n")
+    print(f"\nProcessing {len(companies)} companies (search -> read)...\n")
     tasks = [process_company(c, client, semaphore) for c in companies]
     results = await asyncio.gather(*tasks)
 
@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("run", help="Full pipeline: search → read → assemble (default)")
+    sub.add_parser("run", help="Full pipeline: search -> read -> assemble (default)")
 
     sub.add_parser("search", help="Search for annual reports only (creates new run)")
     sub.add_parser("read", help="Read + classify + assemble (continues latest run)")
