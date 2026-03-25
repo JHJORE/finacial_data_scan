@@ -130,6 +130,51 @@ def _is_ir_landing_page(url: str) -> bool:
     return any(kw in path for kw in _REPORT_PATH_KEYWORDS)
 
 
+def _url_plausibly_belongs_to(url: str, company: Company) -> bool:
+    """Check if a URL plausibly belongs to the given company.
+
+    Prevents accepting PDFs from unrelated companies (e.g., H&M's report
+    when searching for Lifco). Checks the domain and path against the
+    company name and ticker.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    url_text = f"{host} {path}"
+
+    # Extract candidate name tokens from the company name
+    # e.g., "Lifco AB" -> ["lifco"], "AF Gruppen ASA" -> ["af", "gruppen"]
+    skip_words = {"ab", "as", "asa", "plc", "inc", "ltd", "corp", "se", "sa", "ag", "nv", "oyj"}
+    name_tokens = [
+        w for w in company.name.lower().split()
+        if w not in skip_words and len(w) >= 2
+    ]
+
+    # Ticker short (e.g., "LIFCO" from "LIFCO BS SS Equity")
+    ticker_short = company.ticker.split()[0].lower() if company.ticker else ""
+
+    # Check if any name token or the ticker appears in the domain or path
+    for token in name_tokens:
+        if token in url_text:
+            return True
+    if ticker_short and ticker_short in url_text:
+        return True
+
+    # Also accept neutral hosts (news aggregators, stock exchanges, CDNs)
+    # where we can't tell from the domain alone
+    neutral_hosts = {
+        "nasdaq.com", "news.eu.nasdaq.com", "attachment.news.eu.nasdaq.com",
+        "view.news.eu.nasdaq.com", "newsweb.oslobors.no", "cision.com",
+        "news.cision.com", "mfn.se", "storage.mfn.se", "globenewswire.com",
+        "cdn.prod.website-files.com", "live.euronext.com",
+    }
+    for nh in neutral_hosts:
+        if host == nh or host.endswith(f".{nh}"):
+            return True
+
+    return False
+
+
 def _clean_url(url: str) -> str:
     """Strip trailing wildcards, whitespace, and other junk from URLs."""
     return _URL_JUNK_TAIL.sub("", url)
@@ -441,6 +486,9 @@ async def search_company(
             if valid:
                 content_type = await _get_content_type(url)
                 if content_type == "application/pdf":
+                    if not _url_plausibly_belongs_to(url, company):
+                        print(f"    [{company.name}] REJECTED PDF from unrelated domain: {url[:90]}")
+                        continue
                     result = _make_result(
                         company, status="found",
                         report_year=target_year,
@@ -519,6 +567,9 @@ async def search_company(
                         print(f"      -> {u[:90]}")
 
                 for pdf_url in found_urls:
+                    if not _url_plausibly_belongs_to(pdf_url, company):
+                        print(f"    [navigate] rejected unrelated URL: {pdf_url[:90]}")
+                        continue
                     pdf_valid, pdf_reason = await _validate_url(pdf_url)
                     if pdf_valid:
                         return pdf_url
