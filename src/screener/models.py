@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -7,11 +8,24 @@ class Company(BaseModel):
     name: str
     ticker: str
     slug: str
+    first_entry: str  # ISO date string e.g. "2014-02-01"
+    target_year: int  # year before first_entry, e.g. 2013
 
     @classmethod
-    def from_row(cls, name: str, ticker: str) -> "Company":
-        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:80]
-        return cls(name=name, ticker=ticker, slug=slug)
+    def from_row(cls, name: str, ticker: str, first_entry) -> "Company":
+        # Parse first_entry (datetime from openpyxl or string)
+        if isinstance(first_entry, datetime):
+            entry_year = first_entry.year
+            first_entry_str = first_entry.strftime("%Y-%m-%d")
+        else:
+            first_entry_str = str(first_entry).strip()
+            entry_year = int(first_entry_str[:4])
+
+        target_year = entry_year - 1
+        base_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:80]
+        slug = f"{base_slug}-{target_year}"
+        return cls(name=name, ticker=ticker, slug=slug,
+                   first_entry=first_entry_str, target_year=target_year)
 
 
 # --- Search agent schemas ---
@@ -23,6 +37,7 @@ class SearchResult(BaseModel):
     company_name: str
     ticker: str
     slug: str
+    first_entry: str = ""
     status: Literal["found", "not_found", "not_applicable"] = "not_found"
     report_year: int | None = None
     source_url: str = ""
@@ -123,6 +138,7 @@ class ReaderResult(BaseModel):
     company_name: str
     ticker: str
     slug: str
+    first_entry: str = ""
     year: int | None = None
     source_url: str = ""
     source_type: str = ""

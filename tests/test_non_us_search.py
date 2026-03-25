@@ -20,21 +20,20 @@ from screener.reader import read_company
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("company_name,ticker,target_year", [
-    ("Lifco AB", "LIFCO BS SS Equity", 2024),
-    ("Bergman & Beving AB", "BERGB SS Equity", 2024),
-    ("AF Gruppen ASA", "AFG NO Equity", 2024),
-    ("EQVA ASA", "EQVA NO Equity", 2024),
+@pytest.mark.parametrize("company_name,ticker,first_entry", [
+    ("Lifco AB", "LIFCO BS SS Equity", "2025-02-01"),
+    ("Bergman & Beving AB", "BERGB SS Equity", "2025-02-01"),
+    ("AF Gruppen ASA", "AFG NO Equity", "2025-02-01"),
+    ("EQVA ASA", "EQVA NO Equity", "2025-02-01"),
 ])
 async def test_search_non_us_company(
-    company_name, ticker, target_year, gemini_client, semaphore, tmp_path,
+    company_name, ticker, first_entry, gemini_client, semaphore, tmp_path,
 ):
     """Search should find an annual report URL for each non-US company."""
-    config.TARGET_YEAR = target_year
     config.SEARCH_DIR = tmp_path / "search"
     config.SEARCH_DIR.mkdir(parents=True, exist_ok=True)
 
-    company = Company.from_row(company_name, ticker)
+    company = Company.from_row(company_name, ticker, first_entry)
     result = await search_company(company, gemini_client, semaphore)
 
     print(f"\n  Company: {result.company_name}")
@@ -64,14 +63,13 @@ async def test_e2e_lifco(gemini_client, semaphore, tmp_path):
     Lifco is a well-known Swedish serial acquirer (programmatic acquirer)
     with a decentralized model and 10+ acquisitions per year.
     """
-    config.TARGET_YEAR = 2024
     config.SEARCH_DIR = tmp_path / "search"
     config.SEARCH_DIR.mkdir(parents=True, exist_ok=True)
     config.RESULTS_DIR = tmp_path / "results"
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Search
-    company = Company.from_row("Lifco AB", "LIFCO BS SS Equity")
+    company = Company.from_row("Lifco AB", "LIFCO BS SS Equity", "2025-02-01")
     search_result = await search_company(company, gemini_client, semaphore)
 
     print(f"\n  Search: {search_result.status} -> {search_result.source_url}")
@@ -116,14 +114,13 @@ async def test_e2e_bergman_beving(gemini_client, semaphore, tmp_path):
     Bergman & Beving is a Swedish industrial group that acquires niche
     companies, similar to Lifco (they share origins in the Latour group).
     """
-    config.TARGET_YEAR = 2024
     config.SEARCH_DIR = tmp_path / "search"
     config.SEARCH_DIR.mkdir(parents=True, exist_ok=True)
     config.RESULTS_DIR = tmp_path / "results"
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Search
-    company = Company.from_row("Bergman & Beving AB", "BERGB SS Equity")
+    company = Company.from_row("Bergman & Beving AB", "BERGB SS Equity", "2025-02-01")
     search_result = await search_company(company, gemini_client, semaphore)
 
     print(f"\n  Search: {search_result.status} -> {search_result.source_url}")
@@ -167,14 +164,13 @@ async def test_e2e_norwegian_companies(
     Does not assert on the classification outcome since these may or may
     not be programmatic acquirers — we just verify the pipeline works.
     """
-    config.TARGET_YEAR = 2024
     config.SEARCH_DIR = tmp_path / "search"
     config.SEARCH_DIR.mkdir(parents=True, exist_ok=True)
     config.RESULTS_DIR = tmp_path / "results"
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Search
-    company = Company.from_row(company_name, ticker)
+    company = Company.from_row(company_name, ticker, "2025-02-01")
     search_result = await search_company(company, gemini_client, semaphore)
 
     print(f"\n  Search: {search_result.status} -> {search_result.source_url}")

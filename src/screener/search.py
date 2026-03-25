@@ -271,7 +271,7 @@ async def _get_content_type(url: str) -> str:
 
 
 def _build_prompt(company: Company) -> str:
-    target_year = config.TARGET_YEAR
+    target_year = company.target_year
     locale = _ticker_to_locale(company.ticker)
     # Extract short ticker (e.g., "CSU" from "CSU CN Equity")
     ticker_short = company.ticker.split()[0] if company.ticker else company.ticker
@@ -375,6 +375,7 @@ def _make_result(company: Company, *, status: str = "not_found", **kwargs) -> Se
         company_name=company.name,
         ticker=company.ticker,
         slug=company.slug,
+        first_entry=company.first_entry,
         status=status,
         **kwargs,
     )
@@ -389,7 +390,7 @@ async def search_company(
     """
     async with semaphore:
         total_in, total_out = 0, 0
-        target_year = config.TARGET_YEAR
+        target_year = company.target_year
 
         # ── SEC EDGAR for US companies (direct, no AI) ─────────────
         sec_url = await _find_sec_filing(company.name, target_year)
@@ -402,7 +403,7 @@ async def search_company(
                 source_rationale="Verified via SEC EDGAR EFTS API",
                 url_validated=True,
             )
-            print(f"  [ok] {company.name}: sec_edgar -> {sec_url[:90]}")
+            print(f"  [ok] {company.name} ({target_year}): sec_edgar -> {sec_url[:90]}")
             _save_result(company, result)
             return result
 
@@ -475,7 +476,7 @@ async def search_company(
                 total_output_tokens=total_out,
                 error="No URLs found from search",
             )
-            print(f"  [not found] {company.name}: no real URLs in search results")
+            print(f"  [not found] {company.name} ({target_year}): no real URLs in search results")
             _save_result(company, result)
             return result
 
@@ -500,7 +501,7 @@ async def search_company(
                         total_input_tokens=total_in,
                         total_output_tokens=total_out,
                     )
-                    print(f"  [ok] {company.name}: {result.source_type} -> {url[:90]}")
+                    print(f"  [ok] {company.name} ({target_year}): {result.source_type} -> {url[:90]}")
                     _save_result(company, result)
                     return result
                 else:
@@ -590,7 +591,7 @@ async def search_company(
                         total_input_tokens=total_in,
                         total_output_tokens=total_out,
                     )
-                    print(f"  [ok] {company.name}: {result.source_type} -> {pdf_url[:90]}")
+                    print(f"  [ok] {company.name} ({target_year}): {result.source_type} -> {pdf_url[:90]}")
                     _save_result(company, result)
                     return result
 
@@ -620,7 +621,7 @@ async def search_company(
                                 total_input_tokens=total_in,
                                 total_output_tokens=total_out,
                             )
-                            print(f"  [ok] {company.name}: {result.source_type} -> {pdf_url[:90]}")
+                            print(f"  [ok] {company.name} ({target_year}): {result.source_type} -> {pdf_url[:90]}")
                             _save_result(company, result)
                             return result
                         print(f"    [navigate] {page_url[:60]}: no valid PDF after retry")
@@ -643,7 +644,7 @@ async def search_company(
                 total_input_tokens=total_in,
                 total_output_tokens=total_out,
             )
-            print(f"  [ok] {company.name}: IR landing page -> {first_valid_page[:90]}")
+            print(f"  [ok] {company.name} ({target_year}): IR landing page -> {first_valid_page[:90]}")
             _save_result(company, result)
             return result
         elif first_valid_page:
@@ -656,7 +657,7 @@ async def search_company(
             total_output_tokens=total_out,
             error=f"No valid URL found ({len(landing_pages)} landing pages navigated)",
         )
-        print(f"  [not found] {company.name}: no valid URLs found")
+        print(f"  [not found] {company.name} ({target_year}): no valid URLs found")
         _save_result(company, result)
         return result
 
@@ -682,7 +683,7 @@ async def search_companies(
                 _result_path(company).read_text()
             )
             results.append(existing)
-            print(f"  [skip] {company.name} (already searched)")
+            print(f"  [skip] {company.name} ({company.target_year}) (already searched)")
         else:
             to_process.append(company)
 

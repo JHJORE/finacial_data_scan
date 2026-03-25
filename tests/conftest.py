@@ -29,7 +29,8 @@ def acn_search_result():
     return SearchResult(
         company_name="Accenture PLC",
         ticker="ACN US Equity",
-        slug="accenture-plc",
+        slug="accenture-plc-2023",
+        first_entry="2024-02-01",
         status="found",
         report_year=2023,
         source_url="https://www.sec.gov/Archives/edgar/data/1467373/000146737323000324/acn-20230831.htm",

@@ -271,6 +271,7 @@ def _build_reader_result(data: ReaderResponse, search: SearchResult, **extra) ->
         company_name=search.company_name,
         ticker=search.ticker,
         slug=search.slug,
+        first_entry=search.first_entry,
         year=search.report_year,
         source_url=search.source_url,
         source_type=search.source_type,
@@ -300,6 +301,7 @@ def _failed_result(search: SearchResult, total_in: int, total_out: int) -> Reade
         company_name=search.company_name,
         ticker=search.ticker,
         slug=search.slug,
+        first_entry=search.first_entry,
         year=search.report_year,
         source_url=search.source_url,
         source_type=search.source_type,
@@ -364,7 +366,7 @@ async def _read_direct(
                 total_output_tokens=total_out,
             )
             tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
-            print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) "
+            print(f"  [ok] {search.company_name} ({search.report_year}): {tag} ({result.confidence}) "
                   f"[{doc_chars:,} chars via {source_label}]")
             _save_result(result)
             return result
@@ -437,7 +439,7 @@ async def _read_pdf_native(
                 total_output_tokens=total_out,
             )
             tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
-            print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) "
+            print(f"  [ok] {search.company_name} ({search.report_year}): {tag} ({result.confidence}) "
                   f"[{len(pdf_bytes):,} bytes via pdf_native]")
             _save_result(result)
             return result
@@ -507,7 +509,7 @@ async def _read_url_context(
                 total_output_tokens=total_out,
             )
             tag = "PROGRAMMATIC" if result.is_programmatic else "not programmatic"
-            print(f"  [ok] {search.company_name}: {tag} ({result.confidence}) "
+            print(f"  [ok] {search.company_name} ({search.report_year}): {tag} ({result.confidence}) "
                   f"[{tool_tokens:,} tokens via url_context]")
             _save_result(result)
             return result
@@ -601,7 +603,7 @@ async def read_companies(
                 _result_path(search.slug).read_text()
             )
             results.append(existing)
-            print(f"  [skip] {search.company_name} (already read)")
+            print(f"  [skip] {search.company_name} ({search.report_year}) (already read)")
         else:
             to_process.append(search)
 

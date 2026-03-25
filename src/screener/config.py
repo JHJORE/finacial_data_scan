@@ -29,11 +29,8 @@ GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 GEMINI_MODEL = "gemini-3-flash-preview"
 THINKING_LEVEL = "medium"
 
-# Search target year — set via .env or CLI --year flag; defaults to current year
-TARGET_YEAR: int = int(os.getenv("TARGET_YEAR", 0)) or datetime.now().year
-
 # Rate limiting
-MAX_CONCURRENT_REQUESTS = 50
+MAX_CONCURRENT_REQUESTS = 20
 
 # Reader — skip classification if url_context returns too few tokens
 MIN_VIABLE_TOKENS = 10_000

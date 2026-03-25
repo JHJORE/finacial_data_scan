@@ -3,9 +3,7 @@
 Usage:
     uv run python main.py                     # full pipeline, all companies
     uv run python main.py --sample 50         # full pipeline, random sample of 50
-    uv run python main.py --year 2014         # search for 2014 annual reports
     uv run python main.py search              # search only (creates new run)
-    uv run python main.py search --year 2014  # search for 2014 reports
     uv run python main.py read                # read + assemble (reuses latest run)
     uv run python main.py assemble            # assemble matrix from existing results
     uv run python main.py validate            # print random sample for review
@@ -77,7 +75,7 @@ async def cmd_run(args):
     df = assemble_matrix()
     output = save_matrix(df)
     print_summary(df)
-    print(f"\nMatrix saved to: {output}")
+    print(f"\nResults saved to: {output}")
 
 
 async def cmd_search(args):
@@ -107,7 +105,7 @@ async def cmd_read(args):
     df = assemble_matrix()
     output = save_matrix(df)
     print_summary(df)
-    print(f"\nMatrix saved to: {output}")
+    print(f"\nResults saved to: {output}")
 
 
 def cmd_assemble(args):
@@ -117,7 +115,7 @@ def cmd_assemble(args):
     df = assemble_matrix()
     output = save_matrix(df)
     print_summary(df)
-    print(f"\nMatrix saved to: {output}")
+    print(f"\nResults saved to: {output}")
 
 
 def cmd_validate(args):
@@ -142,6 +140,7 @@ def cmd_validate(args):
         print(f"\n{'='*70}")
         print(f"[{i}/{len(sample)}] {r.company_name} ({r.ticker})")
         print(f"{'='*70}")
+        print(f"First entry: {r.first_entry}")
         print(f"Classification: {'PROGRAMMATIC' if r.is_programmatic else 'NOT PROGRAMMATIC'}")
         print(f"Confidence: {r.confidence}")
         print(f"Year: {r.year}")
@@ -187,11 +186,13 @@ def cmd_validate(args):
 def _load_companies() -> list[Company]:
     if not COMPANIES_FILE.exists():
         print(f"ERROR: Company list not found at {COMPANIES_FILE}")
-        print(f"Place your Excel file (with 'acquirer' and 'ticker' columns) at:")
+        print(f"Place your Excel file (with 'acquirer', 'ticker', and 'first_entry' columns) at:")
         print(f"  {COMPANIES_FILE}")
         sys.exit(1)
     companies = load_companies(COMPANIES_FILE)
-    print(f"Loaded {len(companies)} companies from {COMPANIES_FILE}")
+    years = sorted(set(c.target_year for c in companies))
+    print(f"Loaded {len(companies)} company-year rows from {COMPANIES_FILE}")
+    print(f"Target years: {years[0]}–{years[-1]}" if years else "")
     return companies
 
 
@@ -215,7 +216,6 @@ def build_parser() -> argparse.ArgumentParser:
     # --sample is on the global parser (not just run subparser) so it works
     # when invoked without a subcommand: `python main.py --sample 5`
     parser.add_argument("--sample", type=int, default=None, help="Process a random sample of N companies instead of all")
-    parser.add_argument("--year", type=int, default=None, help="Target fiscal year to search for (e.g. 2014). Defaults to current year.")
 
     return parser
 
@@ -223,10 +223,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
-
-    if args.year:
-        config.TARGET_YEAR = args.year
-        print(f"Target year: {args.year}")
 
     command = args.command or "run"
 
