@@ -19,27 +19,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from screener import config
-from screener.config import COMPANIES_FILE, MAX_CONCURRENT_REQUESTS, create_gemini_client, init_run
+from screener.config import COMPANIES_FILE, init_run
 from screener.companies import load_companies
 from screener.models import Company
-from screener.search import search_company
-from screener.reader import read_company
 from screener.assemble import assemble_matrix, print_summary, save_matrix
 
 
-async def process_company(company: Company, client, semaphore: asyncio.Semaphore):
-    """Full pipeline for one company: search then reader."""
-    search_result = await search_company(company, client, semaphore)
-
-    reader_result = None
-    if search_result.status == "found" and not search_result.error:
-        reader_result = await read_company(search_result, client, semaphore)
-
-    return search_result, reader_result
-
-
 async def cmd_run(args):
-    """Full pipeline: search, read, assemble for all companies."""
+    """Full pipeline: search all, then read all, then assemble."""
     init_run(create_new=True)
 
     all_companies = _load_companies()
@@ -51,27 +38,30 @@ async def cmd_run(args):
     else:
         companies = all_companies
 
-    client = create_gemini_client()
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-    print(f"\nProcessing {len(companies)} companies (search -> read)...\n")
-    tasks = [process_company(c, client, semaphore) for c in companies]
-    results = await asyncio.gather(*tasks)
-
-    search_results = [r[0] for r in results]
-    reader_results = [r[1] for r in results if r[1] is not None]
+    # Phase 1: Search all companies (results saved to disk as they complete)
+    from screener.search import search_companies
+    print(f"\n{'='*60}")
+    print(f"Phase 1: Searching {len(companies)} companies...")
+    print(f"{'='*60}\n")
+    search_results = await search_companies(companies, skip_existing=True)
 
     found = sum(1 for r in search_results if r.status == "found")
     na = sum(1 for r in search_results if r.status == "not_applicable")
     search_errors = sum(1 for r in search_results if r.error)
+    print(f"\nSearch: {found}/{len(search_results)} found, {na} not applicable, {search_errors} errors")
+
+    # Phase 2: Read all found companies (loads search results from disk)
+    from screener.reader import read_companies
+    print(f"\n{'='*60}")
+    print(f"Phase 2: Reading {found} found companies...")
+    print(f"{'='*60}\n")
+    reader_results = await read_companies(skip_existing=True)
+
     readers_ok = sum(1 for r in reader_results if not r.error)
     programmatic = sum(1 for r in reader_results if r.is_programmatic)
+    print(f"\nReader: {readers_ok}/{len(reader_results)} read, {programmatic} programmatic")
 
-    print(f"\n{'='*60}")
-    print(f"Search: {found}/{len(search_results)} found, {na} not applicable, {search_errors} errors")
-    print(f"Reader: {readers_ok}/{len(reader_results)} read, {programmatic} programmatic")
-    print(f"{'='*60}")
-
+    # Phase 3: Assemble
     df = assemble_matrix()
     output = save_matrix(df)
     print_summary(df)

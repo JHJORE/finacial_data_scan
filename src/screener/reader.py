@@ -203,6 +203,42 @@ async def _download_pdf(url: str) -> str:
     return text
 
 
+def _verify_pdf_belongs_to_company(pdf_bytes: bytes, company_name: str) -> bool:
+    """Check that the first pages of a PDF mention the company name.
+
+    Extracts text from the first 5 pages and checks if any significant
+    token from the company name appears. This catches wrong-company PDFs
+    early (e.g., getting Guerbet's report when searching for Saint-Gobain).
+    """
+    skip_words = {"ab", "as", "asa", "plc", "inc", "ltd", "corp", "se", "sa",
+                  "ag", "nv", "oyj", "the", "and", "of", "co", "group", "kga"}
+    name_tokens = [
+        w for w in company_name.lower().split()
+        if w not in skip_words and len(w) >= 3
+    ]
+    if not name_tokens:
+        # Very short/generic name — can't reliably verify, let it through
+        return True
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages_to_check = min(len(pdf.pages), 5)
+            text = ""
+            for i in range(pages_to_check):
+                page_text = pdf.pages[i].extract_text() or ""
+                text += page_text.lower() + " "
+
+        # Check if any significant name token appears in the first pages
+        for token in name_tokens:
+            if token in text:
+                return True
+
+        return False
+    except Exception:
+        # If we can't parse the PDF, let it through — the LLM will catch it
+        return True
+
+
 async def _is_pdf_url(url: str) -> bool:
     """Check if a URL points to a PDF by inspecting content-type."""
     if url.lower().endswith('.pdf'):
@@ -559,9 +595,18 @@ async def read_company(
         # Non-SEC: check if the URL is a PDF
         is_pdf = await _is_pdf_url(search.source_url)
         if is_pdf:
-            # Download PDF bytes and use Gemini native PDF processing
+            # Download PDF bytes and verify it's the right company
             try:
                 pdf_bytes = await _download_pdf_bytes(search.source_url)
+
+                if not _verify_pdf_belongs_to_company(pdf_bytes, search.company_name):
+                    print(f"  [wrong doc] {search.company_name}: PDF does not mention "
+                          f"company name in first 5 pages, rejecting")
+                    result = _failed_result(search, 0, 0)
+                    result.error = f"PDF does not belong to {search.company_name} (name not found in first 5 pages)"
+                    _save_result(result)
+                    return result
+
                 return await _read_pdf_native(search, client, pdf_bytes)
             except Exception as e:
                 print(f"  [error] {search.company_name}: PDF native failed: {e}")

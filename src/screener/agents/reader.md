@@ -22,14 +22,15 @@ to "low". Do NOT use your own knowledge about this company.
 <strategy>
   <step n="0" name="Verify correct document">
     BEFORE extracting any evidence, verify that the document is actually for
-    {company_name} (or a predecessor/parent that later became {company_name}).
+    {company_name} (ticker: {ticker}) or a predecessor/parent that later became {company_name}.
 
-    If the document is for a DIFFERENT company entirely, STOP immediately:
+    Confirm the company discussed in the document matches {company_name}.
+    If the document is for a DIFFERENT company, STOP immediately:
     - Set `extracted_text` to "WRONG DOCUMENT: report is for [actual company name], not {company_name}"
     - Set `is_programmatic` to false
     - Set `acquisitions_mentioned` to 0
     - Set `confidence` to "low"
-    - Set `reasoning` to "Document is for a different company"
+    - Set `reasoning` to "Document is for [actual company name], not {company_name}"
     - Set all checklist criteria to false
 
     Also verify the fiscal year matches {report_year} (±1 year is acceptable).

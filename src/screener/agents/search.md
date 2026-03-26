@@ -26,6 +26,9 @@ After 3 searches, report whatever you found and stop. More searches will not hel
 
 NEVER use search operators: filetype:, inurl:, site:, intitle:, or quotes around URLs.
 These do NOT work with Google Search grounding and waste your limited queries.
+
+VERIFY COMPANY MATCH: Before including any result, confirm it is about {company_name}.
+Do NOT include results for a different company.
 </rules>
 
 <strategy>
@@ -44,5 +47,5 @@ List the best results you found. For each, state the URL and what type it is
 - Generic company homepages (e.g., company.com/)
 - News articles about the company
 - Quarterly reports or earnings calls
-- Results for a different company
+- Results for a different company than {company_name}
 </output>
