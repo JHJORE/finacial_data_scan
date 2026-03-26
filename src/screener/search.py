@@ -167,6 +167,7 @@ def _url_plausibly_belongs_to(url: str, company: Company) -> bool:
         "view.news.eu.nasdaq.com", "newsweb.oslobors.no", "cision.com",
         "news.cision.com", "mfn.se", "storage.mfn.se", "globenewswire.com",
         "cdn.prod.website-files.com", "live.euronext.com",
+        "q4cdn.com",  # Q4 Inc — major IR document hosting platform
     }
     for nh in neutral_hosts:
         if host == nh or host.endswith(f".{nh}"):
@@ -181,48 +182,59 @@ def _clean_url(url: str) -> str:
 
 
 async def _find_sec_filing(company_name: str, target_year: int) -> str | None:
-    """Use EDGAR EFTS API to find the correct 10-K/20-F URL for a US company."""
+    """Use EDGAR EFTS API to find the correct 10-K/20-F URL for a US company.
+
+    Tries quoted search first (exact match), then unquoted (broader) if
+    no results — handles cases where the Excel name doesn't match EDGAR's
+    registered entity name exactly (e.g. "3D Systems Corp" vs "3D SYSTEMS INC").
+    """
     start = f"{target_year - 1}-06-01"
     end = f"{target_year + 1}-06-01"
-    query = quote(f'"{company_name}"')
-    efts_url = (
-        f"https://efts.sec.gov/LATEST/search-index?"
-        f"q={query}&forms=10-K,20-F&dateRange=custom&startdt={start}&enddt={end}"
-    )
 
     name_lower = company_name.lower().split()[0]
 
+    # Try quoted first (precise), then unquoted (broader)
+    queries = [
+        quote(f'"{company_name}"'),
+        quote(company_name),
+    ]
+
     try:
         async with httpx.AsyncClient(headers=_SEC_HEADERS, timeout=15) as http:
-            resp = await http.get(efts_url)
-            if resp.status_code != 200:
-                return None
-
-            data = resp.json()
-            hits = data.get("hits", {}).get("hits", [])
-
-            for hit in hits:
-                src = hit.get("_source", {})
-                file_type = src.get("file_type", "")
-                if file_type not in ("10-K", "20-F"):
+            for query in queries:
+                efts_url = (
+                    f"https://efts.sec.gov/LATEST/search-index?"
+                    f"q={query}&forms=10-K,20-F&dateRange=custom&startdt={start}&enddt={end}"
+                )
+                resp = await http.get(efts_url)
+                if resp.status_code != 200:
                     continue
 
-                display_names = src.get("display_names", [])
-                if not any(name_lower in dn.lower() for dn in display_names):
-                    continue
+                data = resp.json()
+                hits = data.get("hits", {}).get("hits", [])
 
-                hit_id = hit.get("_id", "")
-                if ":" not in hit_id:
-                    continue
+                for hit in hits:
+                    src = hit.get("_source", {})
+                    file_type = src.get("file_type", "")
+                    if file_type not in ("10-K", "20-F"):
+                        continue
 
-                accession, filename = hit_id.split(":", 1)
-                ciks = src.get("ciks", [])
-                if not ciks:
-                    continue
+                    display_names = src.get("display_names", [])
+                    if not any(name_lower in dn.lower() for dn in display_names):
+                        continue
 
-                cik = ciks[0].lstrip("0") or "0"
-                acc_no_dashes = accession.replace("-", "")
-                return f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_dashes}/{filename}"
+                    hit_id = hit.get("_id", "")
+                    if ":" not in hit_id:
+                        continue
+
+                    accession, filename = hit_id.split(":", 1)
+                    ciks = src.get("ciks", [])
+                    if not ciks:
+                        continue
+
+                    cik = ciks[0].lstrip("0") or "0"
+                    acc_no_dashes = accession.replace("-", "")
+                    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_dashes}/{filename}"
 
     except Exception:
         pass
@@ -393,19 +405,23 @@ async def search_company(
         target_year = company.target_year
 
         # ── SEC EDGAR for US companies (direct, no AI) ─────────────
-        sec_url = await _find_sec_filing(company.name, target_year)
-        if sec_url:
-            result = _make_result(
-                company, status="found",
-                report_year=target_year,
-                source_url=sec_url,
-                source_type="sec_edgar",
-                source_rationale="Verified via SEC EDGAR EFTS API",
-                url_validated=True,
-            )
-            print(f"  [ok] {company.name} ({target_year}): sec_edgar -> {sec_url[:90]}")
-            _save_result(company, result)
-            return result
+        fallback_year = target_year - 1
+        for try_year in (target_year, fallback_year):
+            sec_url = await _find_sec_filing(company.name, try_year)
+            if sec_url:
+                if try_year != target_year:
+                    print(f"    [{company.name}] fallback: {target_year} not found on EDGAR, using {try_year}")
+                result = _make_result(
+                    company, status="found",
+                    report_year=try_year,
+                    source_url=sec_url,
+                    source_type="sec_edgar",
+                    source_rationale=f"Verified via SEC EDGAR EFTS API (year: {try_year})",
+                    url_validated=True,
+                )
+                print(f"  [ok] {company.name} ({try_year}): sec_edgar -> {sec_url[:90]}")
+                _save_result(company, result)
+                return result
 
         # ── Search-only call (google_search, no url_context) ──────
         prompt = _build_prompt(company)
@@ -553,7 +569,7 @@ async def search_company(
                         contents=enumerate_prompt,
                         config=_URL_READ_CONFIG,
                     ),
-                    timeout=120,
+                    timeout=60,
                 )
                 nonlocal total_in, total_out
                 in_tok, out_tok = extract_token_usage(resp)
