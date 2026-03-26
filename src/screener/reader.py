@@ -353,7 +353,8 @@ def _result_path(slug: str) -> Path:
 
 def _save_result(result: ReaderResult) -> None:
     output_path = _result_path(result.slug)
-    output_path.write_text(result.model_dump_json(indent=2))
+    # Ensure Unicode is always safely persisted on Windows consoles/codepages.
+    output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
 
 def load_search_results() -> list[SearchResult]:
@@ -505,7 +506,7 @@ async def _read_url_context(
     """Read and classify via url_context (for HTML landing pages)."""
     prompt = _build_prompt(search)
     total_in, total_out = 0, 0
-    max_retries = 2
+    max_retries = 5
 
     for attempt in range(max_retries):
         try:

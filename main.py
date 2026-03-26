@@ -64,11 +64,17 @@ async def cmd_run(args):
     found = sum(1 for r in search_results if r.status == "found")
     na = sum(1 for r in search_results if r.status == "not_applicable")
     search_errors = sum(1 for r in search_results if r.error)
+    resource_exhausted_errors = sum(
+        1
+        for r in search_results
+        if r.error and "RESOURCE_EXHAUSTED" in r.error
+    )
     readers_ok = sum(1 for r in reader_results if not r.error)
     programmatic = sum(1 for r in reader_results if r.is_programmatic)
 
     print(f"\n{'='*60}")
     print(f"Search: {found}/{len(search_results)} found, {na} not applicable, {search_errors} errors")
+    print(f"Search RESOURCE_EXHAUSTED errors: {resource_exhausted_errors}/{len(search_results)}")
     print(f"Reader: {readers_ok}/{len(reader_results)} read, {programmatic} programmatic")
     print(f"{'='*60}")
 
@@ -90,7 +96,9 @@ async def cmd_search(args):
     found = sum(1 for r in results if r.status == "found")
     na = sum(1 for r in results if r.status == "not_applicable")
     errors = sum(1 for r in results if r.error)
+    resource_exhausted_errors = sum(1 for r in results if r.error and "RESOURCE_EXHAUSTED" in r.error)
     print(f"\nDone: {found}/{len(results)} found, {na} not applicable, {errors} errors")
+    print(f"Search RESOURCE_EXHAUSTED errors: {resource_exhausted_errors}/{len(results)}")
 
 
 async def cmd_read(args):

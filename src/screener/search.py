@@ -425,7 +425,8 @@ async def search_company(
         search_queries: list[str] = []
         real_urls: list[str] = []
 
-        for attempt in range(2):
+        max_retries = 5
+        for attempt in range(max_retries):
             try:
                 resp = await asyncio.wait_for(
                     client.aio.models.generate_content(
@@ -466,9 +467,15 @@ async def search_company(
                 break
             except Exception as e:
                 error_str = str(e) or type(e).__name__
-                if is_retryable(error_str) and attempt == 0:
+                if is_retryable(error_str) and attempt < max_retries - 1:
                     wait = backoff(attempt)
-                    print(f"  [retry] {company.name}: {error_str[:80]}")
+                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                        # For quota/rate-limit we pause longer to let the service recover.
+                        wait *= 3
+                    print(
+                        f"  [retry] {company.name}: {error_str[:80]}, "
+                        f"attempt {attempt + 1}/{max_retries}, waiting {wait:.0f}s..."
+                    )
                     await asyncio.sleep(wait)
                     continue
                 print(f"  [error] {company.name}: search failed: {error_str[:120]}")
@@ -617,31 +624,45 @@ async def search_company(
             except Exception as e:
                 error_str = str(e) or type(e).__name__
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    wait = backoff(0) * 3
-                    print(f"    [navigate rate-limit] {page_url[:60]}: waiting {wait:.0f}s...")
-                    await asyncio.sleep(wait)
-                    try:
-                        pdf_url = await _try_navigate()
-                        if pdf_url:
-                            result = _make_result(
-                                company, status="found",
-                                report_year=target_year,
-                                source_url=pdf_url,
-                                source_type=_classify_source_type(pdf_url),
-                                source_rationale="Found via url_context page navigation (retry)",
-                                url_validated=True,
-                                search_queries_used=search_queries,
-                                total_input_tokens=total_in,
-                                total_output_tokens=total_out,
-                            )
-                            print(f"  [ok] {company.name} ({target_year}): {result.source_type} -> {pdf_url[:90]}")
-                            _save_result(company, result)
-                            return result
-                        print(f"    [navigate] {page_url[:60]}: no valid PDF after retry")
-                    except Exception as e2:
-                        print(f"    [navigate error] {page_url[:60]}: retry failed: {str(e2)[:80]}")
-                else:
-                    print(f"    [navigate error] {page_url[:60]}: {error_str[:80]}")
+                    # Rate limit is often transient; retry the url_context navigation a few times.
+                    max_nav_retries = 5
+                    for nav_attempt in range(max_nav_retries):
+                        wait = backoff(nav_attempt) * 3
+                        print(
+                            f"    [navigate rate-limit] {page_url[:60]}: waiting {wait:.0f}s... "
+                            f"(attempt {nav_attempt + 1}/{max_nav_retries})"
+                        )
+                        await asyncio.sleep(wait)
+                        try:
+                            pdf_url = await _try_navigate()
+                            if pdf_url:
+                                result = _make_result(
+                                    company,
+                                    status="found",
+                                    report_year=target_year,
+                                    source_url=pdf_url,
+                                    source_type=_classify_source_type(pdf_url),
+                                    source_rationale="Found via url_context page navigation (retry)",
+                                    url_validated=True,
+                                    search_queries_used=search_queries,
+                                    total_input_tokens=total_in,
+                                    total_output_tokens=total_out,
+                                )
+                                print(
+                                    f"  [ok] {company.name} ({target_year}): {result.source_type} -> {pdf_url[:90]}"
+                                )
+                                _save_result(company, result)
+                                return result
+                            print(f"    [navigate] {page_url[:60]}: no valid PDF found on retry attempt")
+                            break
+                        except Exception as e2:
+                            # Keep looping until attempt budget is exhausted.
+                            last_err = str(e2) or type(e2).__name__
+                            if nav_attempt == max_nav_retries - 1:
+                                print(f"    [navigate error] {page_url[:60]}: retries failed: {last_err[:80]}")
+                            continue
+                    continue
+                print(f"    [navigate error] {page_url[:60]}: {error_str[:80]}")
                 continue
 
         # ── Last resort: return landing page only if it's an IR/report page ─────
@@ -677,7 +698,8 @@ async def search_company(
 
 def _save_result(company: Company, result: SearchResult) -> None:
     output_path = _result_path(company)
-    output_path.write_text(result.model_dump_json(indent=2))
+    # Ensure Unicode is always safely persisted on Windows consoles/codepages.
+    output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
 
 async def search_companies(

@@ -30,14 +30,14 @@ GEMINI_MODEL = "gemini-3-flash-preview"
 THINKING_LEVEL = "medium"
 
 # Rate limiting
-MAX_CONCURRENT_REQUESTS = 20
+MAX_CONCURRENT_REQUESTS = 5
 
 # Reader — skip classification if url_context returns too few tokens
 MIN_VIABLE_TOKENS = 10_000
 
 # SEC-specific: more retries (transient url_context failures) and lower token
 # threshold (10-K filings are structured; even partial reads contain M&A sections)
-SEC_MAX_RETRIES = 3
+SEC_MAX_RETRIES = 5
 SEC_MIN_VIABLE_TOKENS = 5_000
 
 # SEC document size guard (character count after HTML parsing)
