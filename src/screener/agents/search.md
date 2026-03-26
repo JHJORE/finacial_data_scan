@@ -21,41 +21,28 @@ try searching in the local language.
 </task>
 
 <rules>
-HARD LIMITS — violating these is a failure:
-1. You may make AT MOST 3 google_search calls. Quality over quantity.
-2. NEVER use search operators: filetype:, inurl:, site:, intitle:, or quotes around URLs.
-   These do NOT work with Google Search grounding and waste your limited queries.
-3. NEVER do more than 3 searches. If you haven't found it in 3, you won't find it in 10.
+CRITICAL: You MUST stop after 3 google_search calls. Do NOT make a 4th search.
+After 3 searches, report whatever you found and stop. More searches will not help.
+
+NEVER use search operators: filetype:, inurl:, site:, intitle:, or quotes around URLs.
+These do NOT work with Google Search grounding and waste your limited queries.
 </rules>
 
 <strategy>
-Work smart, not hard. A good first query usually gets you there:
-
 1. **First search**: "{company_name} annual report {target_year}"
-2. **Second search** (only if needed): Try the local language for {country}
-3. **Third search** (last resort): Try the ticker:
-   "{ticker_short} annual report {target_year} investor relations"
+2. **Second search** (only if first had no good results): Try the local language for {country}
+3. **Third search** (last resort): "{ticker_short} annual report {target_year} investor relations"
 
-Most companies are found in 1-2 searches.
+After each search, check if you already have a good result. If yes, STOP searching.
 </strategy>
 
 <output>
-After searching, evaluate the top 5 results and rank them by relevance:
+List the best results you found. For each, state the URL and what type it is
+(PDF, IR page, press release, SEC filing).
 
-**Priority order** (return the BEST match):
-1. **Direct PDF link** to the annual report — this is the ideal result
-2. **Investor relations documents/reports page** where the annual report can be downloaded
-3. **Press release** announcing the annual report publication (often contains a PDF link)
-4. **SEC filing page** (for US companies) with the 10-K or 20-F
-
-**For each result**, state:
-- The URL
-- What type it is (PDF, IR page, press release, etc.)
-- Whether it matches {target_year}, {fallback_year_next}, or {fallback_year_prev}
-
-**Reject** results that are:
+**Reject** these — do NOT include them:
 - Generic company homepages (e.g., company.com/)
-- News articles about the company (not the annual report itself)
-- Quarterly reports or earnings calls (we need the ANNUAL report)
-- Results for the wrong company
+- News articles about the company
+- Quarterly reports or earnings calls
+- Results for a different company
 </output>

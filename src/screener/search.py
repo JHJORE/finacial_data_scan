@@ -167,7 +167,6 @@ def _url_plausibly_belongs_to(url: str, company: Company) -> bool:
         "view.news.eu.nasdaq.com", "newsweb.oslobors.no", "cision.com",
         "news.cision.com", "mfn.se", "storage.mfn.se", "globenewswire.com",
         "cdn.prod.website-files.com", "live.euronext.com",
-        "q4cdn.com",  # Q4 Inc — major IR document hosting platform
     }
     for nh in neutral_hosts:
         if host == nh or host.endswith(f".{nh}"):
@@ -494,8 +493,15 @@ async def search_company(
 
         # ── Check for direct PDF hits, collect HTML pages for navigation ──
         landing_pages: list[str] = []
+        failed_domains: set[str] = set()  # skip domains with SSL or persistent errors
         for url in real_urls:
+            host = urlparse(url).hostname or ""
+            if host in failed_domains:
+                print(f"    [skip] {url[:90]} (domain already failed)")
+                continue
             valid, reason = await _validate_url(url)
+            if "CERTIFICATE_VERIFY_FAILED" in reason or "SSL" in reason:
+                failed_domains.add(host)
             if valid:
                 content_type = await _get_content_type(url)
                 if content_type == "application/pdf":
@@ -580,10 +586,16 @@ async def search_company(
                         print(f"      -> {u[:90]}")
 
                 for pdf_url in found_urls:
+                    pdf_host = urlparse(pdf_url).hostname or ""
+                    if pdf_host in failed_domains:
+                        print(f"    [skip] {pdf_url[:90]} (domain already failed)")
+                        continue
                     if not _url_plausibly_belongs_to(pdf_url, company):
                         print(f"    [navigate] rejected unrelated URL: {pdf_url[:90]}")
                         continue
                     pdf_valid, pdf_reason = await _validate_url(pdf_url)
+                    if "CERTIFICATE_VERIFY_FAILED" in pdf_reason or "SSL" in pdf_reason:
+                        failed_domains.add(pdf_host)
                     if pdf_valid:
                         return pdf_url
                     print(f"    [validate pdf] {pdf_url[:90]} -> {pdf_reason}")
