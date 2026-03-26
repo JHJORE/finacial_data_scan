@@ -126,6 +126,91 @@ def cmd_assemble(args):
     print(f"\nResults saved to: {output}")
 
 
+async def cmd_retry(args):
+    """Retry failed companies from a previous run."""
+    import csv
+
+    # Resolve source run directory
+    if args.retry_from:
+        source_run = RUNS_DIR / args.retry_from
+        if not source_run.is_dir():
+            print(f"ERROR: Run directory not found: {source_run}")
+            sys.exit(1)
+    else:
+        source_run = _resolve_latest_run_dir()
+        if source_run is None:
+            print("ERROR: No latest run found. Specify one with --from.")
+            sys.exit(1)
+
+    source_csv = source_run / "output" / "results.csv"
+    if not source_csv.exists():
+        print(f"ERROR: No results.csv found at {source_csv}")
+        sys.exit(1)
+
+    # Collect failed company identifiers
+    failed_keys: set[tuple[str, str, str]] = set()
+    with open(source_csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["status"] in ("not_found", "not_found_correct_document"):
+                # Normalise first_entry to YYYY-MM-DD for matching
+                entry = row["first_entry"].strip()[:10]
+                failed_keys.add((row["acquirer"].strip(), row["ticker"].strip(), entry))
+
+    if not failed_keys:
+        print("No failed companies found in the source run. Nothing to retry.")
+        return
+
+    print(f"Found {len(failed_keys)} failed companies to retry from {source_run.name}")
+
+    # Load and filter companies
+    all_companies = _load_companies()
+    companies = [
+        c
+        for c in all_companies
+        if (c.name, c.ticker, str(c.first_entry)[:10]) in failed_keys
+    ]
+
+    if not companies:
+        print("ERROR: Could not match any failed companies to the Excel file.")
+        sys.exit(1)
+
+    print(f"Matched {len(companies)} companies from Excel file")
+
+    # Set up retry subdirectory inside the source run
+    init_retry(source_run)
+
+    client = create_gemini_client()
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    print(f"\nRetrying {len(companies)} companies (search -> read)...\n")
+    tasks = [process_company(c, client, semaphore) for c in companies]
+    results = await asyncio.gather(*tasks)
+
+    search_results = [r[0] for r in results]
+    reader_results = [r[1] for r in results if r[1] is not None]
+
+    found = sum(1 for r in search_results if r.status == "found")
+    na = sum(1 for r in search_results if r.status == "not_applicable")
+    search_errors = sum(1 for r in search_results if r.error)
+    resource_exhausted_errors = sum(
+        1 for r in search_results if r.error and "RESOURCE_EXHAUSTED" in r.error
+    )
+    readers_ok = sum(1 for r in reader_results if not r.error)
+    programmatic = sum(1 for r in reader_results if r.is_programmatic)
+
+    print(f"\n{'='*60}")
+    print(f"Retry Search: {found}/{len(search_results)} found, {na} not applicable, {search_errors} errors")
+    print(f"Search RESOURCE_EXHAUSTED errors: {resource_exhausted_errors}/{len(search_results)}")
+    print(f"Retry Reader: {readers_ok}/{len(reader_results)} read, {programmatic} programmatic")
+    print(f"{'='*60}")
+
+    df = assemble_matrix()
+    output = save_matrix(df)
+    print_summary(df)
+    print(f"\nRetry results saved to: {output}")
+
+
 def cmd_validate(args):
     """Print random sample of results for manual review."""
     init_run(create_new=False)
@@ -218,6 +303,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("read", help="Read + classify + assemble (continues latest run)")
     sub.add_parser("assemble", help="Re-assemble matrix from existing results")
 
+    retry_p = sub.add_parser("retry", help="Retry failed companies from a previous run")
+    retry_p.add_argument("--from", dest="retry_from", type=str, default=None,
+                         help="Run directory name to retry (default: latest)")
+
     val_p = sub.add_parser("validate", help="Print random sample for manual review")
     val_p.add_argument("--n", type=int, default=10, help="Number of results to review")
 
@@ -242,6 +331,8 @@ def main():
         asyncio.run(cmd_read(args))
     elif command == "assemble":
         cmd_assemble(args)
+    elif command == "retry":
+        asyncio.run(cmd_retry(args))
     elif command == "validate":
         cmd_validate(args)
 
