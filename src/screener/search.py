@@ -25,26 +25,26 @@ _INSTRUCTIONS = (AGENTS_DIR / "search.md").read_text()
 
 _REDIRECT_HOST = "vertexaisearch.cloud.google.com"
 
-# Bloomberg exchange suffix → locale info for search hints
+# Bloomberg exchange suffix → country for search hints
 _LOCALE_MAP: dict[str, dict[str, str]] = {
-    "SS": {"country": "Sweden", "language": "Swedish", "local_term": "årsredovisning"},
-    "NO": {"country": "Norway", "language": "Norwegian", "local_term": "årsrapport"},
-    "DC": {"country": "Denmark", "language": "Danish", "local_term": "årsrapport"},
-    "FH": {"country": "Finland", "language": "Finnish", "local_term": "vuosikertomus"},
-    "GR": {"country": "Germany", "language": "German", "local_term": "Geschäftsbericht"},
-    "SW": {"country": "Switzerland", "language": "German", "local_term": "Geschäftsbericht"},
-    "FP": {"country": "France", "language": "French", "local_term": "rapport annuel"},
-    "NA": {"country": "Netherlands", "language": "Dutch", "local_term": "jaarverslag"},
-    "BB": {"country": "Belgium", "language": "Dutch/French", "local_term": "jaarverslag / rapport annuel"},
-    "IM": {"country": "Italy", "language": "Italian", "local_term": "relazione annuale"},
-    "SM": {"country": "Spain", "language": "Spanish", "local_term": "informe anual"},
-    "PL": {"country": "Poland", "language": "Polish", "local_term": "raport roczny"},
-    "LN": {"country": "United Kingdom", "language": "English", "local_term": "annual report"},
-    "ID": {"country": "Ireland", "language": "English", "local_term": "annual report"},
-    "CN": {"country": "Canada", "language": "English/French", "local_term": "annual report / rapport annuel"},
-    "CT": {"country": "Canada", "language": "English/French", "local_term": "annual report / rapport annuel"},
-    "AT": {"country": "Australia", "language": "English", "local_term": "annual report"},
-    "US": {"country": "United States", "language": "English", "local_term": "annual report"},
+    "SS": {"country": "Sweden"},
+    "NO": {"country": "Norway"},
+    "DC": {"country": "Denmark"},
+    "FH": {"country": "Finland"},
+    "GR": {"country": "Germany"},
+    "SW": {"country": "Switzerland"},
+    "FP": {"country": "France"},
+    "NA": {"country": "Netherlands"},
+    "BB": {"country": "Belgium"},
+    "IM": {"country": "Italy"},
+    "SM": {"country": "Spain"},
+    "PL": {"country": "Poland"},
+    "LN": {"country": "United Kingdom"},
+    "ID": {"country": "Ireland"},
+    "CN": {"country": "Canada"},
+    "CT": {"country": "Canada"},
+    "AT": {"country": "Australia"},
+    "US": {"country": "United States"},
 }
 
 
@@ -55,7 +55,7 @@ def _ticker_to_locale(ticker: str) -> dict[str, str]:
         exchange = parts[-2].upper() if parts[-1].upper() == "EQUITY" else parts[-1].upper()
         if exchange in _LOCALE_MAP:
             return _LOCALE_MAP[exchange]
-    return {"country": "Unknown", "language": "English", "local_term": "annual report"}
+    return {"country": "Unknown"}
 
 
 _THINKING = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
@@ -285,17 +285,14 @@ async def _get_content_type(url: str) -> str:
 def _build_prompt(company: Company) -> str:
     target_year = company.target_year
     locale = _ticker_to_locale(company.ticker)
-    # Extract short ticker (e.g., "CSU" from "CSU CN Equity")
     ticker_short = company.ticker.split()[0] if company.ticker else company.ticker
-    locale_hint = f"{locale['country']} ({locale['language']})"
     return _INSTRUCTIONS.format(
         company_name=company.name,
-        ticker=company.ticker,
         ticker_short=ticker_short,
         target_year=target_year,
-        fallback_year=target_year - 1,
-        locale_hint=locale_hint,
-        local_term=locale["local_term"],
+        fallback_year_next=target_year + 1,
+        fallback_year_prev=target_year - 1,
+        country=locale["country"],
     )
 
 
@@ -405,8 +402,7 @@ async def search_company(
         target_year = company.target_year
 
         # ── SEC EDGAR for US companies (direct, no AI) ─────────────
-        fallback_year = target_year - 1
-        for try_year in (target_year, fallback_year):
+        for try_year in (target_year, target_year + 1, target_year - 1):
             sec_url = await _find_sec_filing(company.name, try_year)
             if sec_url:
                 if try_year != target_year:
@@ -544,17 +540,17 @@ async def search_company(
                 f"  <page_url>{page_url}</page_url>\n"
                 f"  <company>{company.name}</company>\n"
                 f"  <target_year>{target_year}</target_year>\n"
-                f"  <fallback_year>{target_year - 1}</fallback_year>\n"
+                f"  <fallback_years>{target_year + 1} or {target_year - 1}</fallback_years>\n"
                 f"</context>\n"
                 f"<task>\n"
                 f"  1. Read this page carefully\n"
                 f"  2. List ALL downloadable document links you find (PDFs, download buttons, document archive links)\n"
                 f"  3. For each link, state: the URL, the document title/label, and the year if visible\n"
-                f"  4. Then identify which link is the annual report for fiscal year {target_year} (or {target_year - 1})\n"
+                f"  4. Then identify which link is the annual report for fiscal year {target_year} (or {target_year + 1} or {target_year - 1})\n"
                 f"  5. Return ONLY that URL as the last line of your response\n"
                 f"</task>\n"
                 f"<hints>\n"
-                f"  - Annual reports may be labeled: \"{locale['local_term']}\"\n"
+                f"  - The company is based in {locale['country']} — the annual report may be in the local language\n"
                 f"  - Look for PDF icons, download sections, document libraries\n"
                 f"  - The link might be in a table, list, or card layout\n"
                 f"  - If this is a navigation page, look for a link to the reports/documents section\n"

@@ -20,6 +20,21 @@ to "low". Do NOT use your own knowledge about this company.
 <task>Read the annual report and classify whether this company is a programmatic acquirer.</task>
 
 <strategy>
+  <step n="0" name="Verify correct document">
+    BEFORE extracting any evidence, verify that the document is actually for
+    {company_name} (or a predecessor/parent that later became {company_name}).
+
+    If the document is for a DIFFERENT company entirely, STOP immediately:
+    - Set `extracted_text` to "WRONG DOCUMENT: report is for [actual company name], not {company_name}"
+    - Set `is_programmatic` to false
+    - Set `acquisitions_mentioned` to 0
+    - Set `confidence` to "low"
+    - Set `reasoning` to "Document is for a different company"
+    - Set all checklist criteria to false
+
+    Also verify the fiscal year matches {report_year} (±1 year is acceptable).
+  </step>
+
   <step n="1" name="Extract evidence">
     Read the annual report at the URL above. Extract ALL verbatim text related to:
     - How the company describes its acquisition/M&A strategy
