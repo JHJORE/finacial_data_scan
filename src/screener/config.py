@@ -99,6 +99,30 @@ def init_run(create_new: bool = True) -> Path:
     return run_dir
 
 
+def init_retry(run_dir: Path) -> Path:
+    """Set up a retry sub-run inside an existing run directory.
+
+    Creates ``retry/{search,results,output,debug}`` folders inside *run_dir*
+    and points the global directory variables at them.  Does NOT update the
+    ``latest`` pointer.
+    """
+    global SEARCH_DIR, RESULTS_DIR, OUTPUT_DIR, DEBUG_DIR
+
+    retry_dir = run_dir / "retry"
+    SEARCH_DIR = retry_dir / "search"
+    RESULTS_DIR = retry_dir / "results"
+    OUTPUT_DIR = retry_dir / "output"
+    DEBUG_DIR = retry_dir / "debug"
+
+    SEARCH_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"Retry directory: {retry_dir}")
+    return retry_dir
+
+
 def create_gemini_client(api_version: str = "v1beta1") -> genai.Client:
     """Create a Gemini API client using Vertex AI."""
     return genai.Client(

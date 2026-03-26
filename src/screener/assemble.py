@@ -11,7 +11,7 @@ from .models import ReaderResult, SearchResult
 def load_all_search() -> dict[str, SearchResult]:
     results = {}
     for path in sorted(config.SEARCH_DIR.glob("*.json")):
-        result = SearchResult.model_validate_json(path.read_text())
+        result = SearchResult.model_validate_json(path.read_text(encoding="utf-8"))
         results[result.slug] = result
     return results
 
@@ -19,7 +19,7 @@ def load_all_search() -> dict[str, SearchResult]:
 def load_all_results() -> list[ReaderResult]:
     results = []
     for path in sorted(config.RESULTS_DIR.glob("*.json")):
-        result = ReaderResult.model_validate_json(path.read_text())
+        result = ReaderResult.model_validate_json(path.read_text(encoding="utf-8"))
         results.append(result)
     return results
 
